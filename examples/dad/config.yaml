@@ -1,0 +1,13 @@
+seed: 2030
+budget: 10
+train_episodes: 16384
+eval_episodes: 512
+contrastives: 31
+batch_size: 256
+epochs: 100
+learning_rate: 0.0003
+devices: 1
+runs: runs
+wandb_project: pybed-dad
+wandb_mode: offline
+checkpoint: null

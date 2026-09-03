@@ -11,6 +11,17 @@ import numpy as np
 import torch
 
 Array = np.ndarray | torch.Tensor
+Result = dict[str, Any]
+
+
+def result(value: Any = None, *, primary: str | None = None) -> Result:
+    """Take a model output and return design, infer, and predict entries."""
+    output = {"design": None, "infer": None, "predict": None}
+    if isinstance(value, Mapping):
+        output.update({name: value.get(name) for name in output})
+    elif primary is not None:
+        output[primary] = value
+    return output
 
 
 def _map_tree(value: Any, fn: Callable[[Any], Any]) -> Any:
@@ -110,25 +121,25 @@ class Spec:
 
 @dataclass(frozen=True)
 class Observation:
-    """Keep one observation as its design ``x`` and outcome ``y``."""
+    """Keep one observation as a design and its measured outcome."""
 
-    x: Any
-    y: Any
-
-    @property
-    def design(self) -> Any:
-        """Return the design part of the observation."""
-        return self.x
+    design: Any
+    outcome: Any
 
     @property
-    def outcome(self) -> Any:
-        """Return the measured outcome part of the observation."""
-        return self.y
+    def x(self) -> Any:
+        """Return the design using its short mathematical name."""
+        return self.design
+
+    @property
+    def y(self) -> Any:
+        """Return the outcome using its short mathematical name."""
+        return self.outcome
 
     def __iter__(self):
-        """Yield ``x`` and then ``y`` so the pair can be unpacked."""
-        yield self.x
-        yield self.y
+        """Yield the design and then the outcome for pair unpacking."""
+        yield self.design
+        yield self.outcome
 
 
 @dataclass(frozen=True)
@@ -244,69 +255,123 @@ class Batch:
 
     def __init__(
         self,
-        theta: Array | None = None,
-        x: Array | None = None,
-        y: Array | None = None,
+        parameters: Array | None = None,
+        designs: Array | None = None,
+        outcomes: Array | None = None,
         mask: Array | None = None,
         target: Any = None,
         belief: ParticleCloud | None = None,
         context: Mapping[str, Any] | None = None,
         meta: Mapping[str, Any] | None = None,
         *,
+        theta: Array | None = None,
+        x: Array | None = None,
+        y: Array | None = None,
         design: Array | None = None,
         outcome: Array | None = None,
         o: Observation | tuple[Any, Any] | None = None,
         obs: Observation | tuple[Any, Any] | None = None,
     ) -> None:
-        """Take either ``x,y`` or their aliases and build one batch."""
-        if design is not None:
-            if x is not None:
-                raise TypeError("Pass x or design, not both")
-            x = design
-        if outcome is not None:
-            if y is not None:
-                raise TypeError("Pass y or outcome, not both")
-            y = outcome
+        """Take parameters and observation arrays and return a new batch."""
+        if theta is not None:
+            if parameters is not None:
+                raise TypeError("Pass parameters or theta, not both")
+            parameters = theta
+        if designs is not None and (x is not None or design is not None):
+            raise TypeError("Pass designs or x/design, not both")
+        if outcomes is not None and (y is not None or outcome is not None):
+            raise TypeError("Pass outcomes or y/outcome, not both")
+        if x is not None and design is not None:
+            raise TypeError("Pass x or design, not both")
+        if y is not None and outcome is not None:
+            raise TypeError("Pass y or outcome, not both")
+        designs = designs if designs is not None else x if x is not None else design
+        outcomes = outcomes if outcomes is not None else y if y is not None else outcome
         pair = o if o is not None else obs
         if o is not None and obs is not None:
             raise TypeError("Pass o or obs, not both")
         if pair is not None:
-            pair_x, pair_y = (pair.x, pair.y) if isinstance(pair, Observation) else pair
-            if x is not None or y is not None:
-                raise TypeError("Pass an observation pair or x/y, not both")
-            x, y = pair_x, pair_y
-        self.theta, self.x, self.y = theta, x, y
+            pair_design, pair_outcome = (pair.design, pair.outcome) if isinstance(pair, Observation) else pair
+            if designs is not None or outcomes is not None:
+                raise TypeError("Pass an observation pair or separate designs/outcomes, not both")
+            designs, outcomes = pair_design, pair_outcome
+        self.theta, self.x, self.y = parameters, designs, outcomes
         self.mask, self.target, self.belief = mask, target, belief
         self.context, self.meta = dict(context or {}), dict(meta or {})
 
     @property
+    def parameters(self) -> Array | None:
+        """Return the parameter values stored in the batch."""
+        return self.theta
+
+    @parameters.setter
+    def parameters(self, value: Array | None) -> None:
+        """Take parameter values and store them in the batch."""
+        self.theta = value
+
+    @property
+    def thetas(self) -> Array | None:
+        """Return the parameter values using their mathematical plural."""
+        return self.theta
+
+    @thetas.setter
+    def thetas(self, value: Array | None) -> None:
+        """Take parameter values and store them as theta values."""
+        self.theta = value
+
+    @property
+    def designs(self) -> Array | None:
+        """Return all designs stored in the batch."""
+        return self.x
+
+    @designs.setter
+    def designs(self, value: Array | None) -> None:
+        """Take design values and store them in the batch."""
+        self.x = value
+
+    @property
     def design(self) -> Array | None:
-        """Return ``x``, the design part of each observation."""
+        """Return the design or designs stored in the batch."""
         return self.x
 
     @design.setter
     def design(self, value: Array | None) -> None:
-        """Take a design value and store it as ``x``."""
+        """Take design values and store them in the batch."""
         self.x = value
 
     @property
+    def outcomes(self) -> Array | None:
+        """Return all measured outcomes stored in the batch."""
+        return self.y
+
+    @outcomes.setter
+    def outcomes(self, value: Array | None) -> None:
+        """Take measured outcomes and store them in the batch."""
+        self.y = value
+
+    @property
     def outcome(self) -> Array | None:
-        """Return ``y``, the measured outcome part of each observation."""
+        """Return the outcome or outcomes stored in the batch."""
         return self.y
 
     @outcome.setter
     def outcome(self, value: Array | None) -> None:
-        """Take an outcome value and store it as ``y``."""
+        """Take measured outcomes and store them in the batch."""
         self.y = value
 
     @property
     def o(self) -> Observation:
-        """Return the complete observation pair ``(x, y)``."""
+        """Return the complete observations using their short mathematical name."""
         return Observation(self.x, self.y)
 
     @property
     def obs(self) -> Observation:
-        """Return the complete observation pair ``(x, y)``."""
+        """Return the complete design-and-outcome observations."""
+        return self.o
+
+    @property
+    def observations(self) -> Observation:
+        """Return all designs and outcomes as one observation pair."""
         return self.o
 
     def __len__(self) -> int:
@@ -338,9 +403,9 @@ class Batch:
         """Take a batch index and return the selected record or smaller batch."""
         size = len(self)
         return Batch(
-            theta=_index_tree(self.theta, index, size),
-            x=_index_tree(self.x, index, size),
-            y=_index_tree(self.y, index, size),
+            parameters=_index_tree(self.parameters, index, size),
+            designs=_index_tree(self.designs, index, size),
+            outcomes=_index_tree(self.outcomes, index, size),
             mask=_index_tree(self.mask, index, size),
             target=_index_tree(self.target, index, size),
             belief=_index_tree(self.belief, index, size),
@@ -360,9 +425,9 @@ class Batch:
             return value
 
         return Batch(
-            theta=_map_tree(self.theta, move),
-            x=_map_tree(self.x, move),
-            y=_map_tree(self.y, move),
+            parameters=_map_tree(self.parameters, move),
+            designs=_map_tree(self.designs, move),
+            outcomes=_map_tree(self.outcomes, move),
             mask=_map_tree(self.mask, move),
             target=_map_tree(self.target, move),
             belief=_map_tree(self.belief, move),
@@ -374,9 +439,9 @@ class Batch:
         """Return a batch whose tensor fields are NumPy arrays on the CPU."""
         convert = lambda value: value.detach().cpu().numpy() if torch.is_tensor(value) else value
         return Batch(
-            theta=_map_tree(self.theta, convert),
-            x=_map_tree(self.x, convert),
-            y=_map_tree(self.y, convert),
+            parameters=_map_tree(self.parameters, convert),
+            designs=_map_tree(self.designs, convert),
+            outcomes=_map_tree(self.outcomes, convert),
             mask=_map_tree(self.mask, convert),
             target=_map_tree(self.target, convert),
             belief=_map_tree(self.belief, convert),
@@ -388,9 +453,9 @@ class Batch:
         """Return a batch detached from autograd and stored on the CPU."""
         detach = lambda value: value.detach().cpu() if torch.is_tensor(value) else value
         return Batch(
-            theta=_map_tree(self.theta, detach),
-            x=_map_tree(self.x, detach),
-            y=_map_tree(self.y, detach),
+            parameters=_map_tree(self.parameters, detach),
+            designs=_map_tree(self.designs, detach),
+            outcomes=_map_tree(self.outcomes, detach),
             mask=_map_tree(self.mask, detach),
             target=_map_tree(self.target, detach),
             belief=_map_tree(self.belief, detach),
@@ -511,9 +576,6 @@ class BED:
     policy: Callable[..., Array | PolicySample] | None = None
     posterior: Callable[..., Any] | None = None
     predictor: Callable[..., Any] | None = None
-    joint_infer_design: Callable[..., Any] | None = None
-    joint_design_predict: Callable[..., Any] | None = None
-    joint_design_infer_predict: Callable[..., Any] | None = None
     likelihood: Callable[..., Array] | None = None
     candidate_pool: Array | Callable[..., Array] | None = None
     vectorized: bool = True
@@ -532,9 +594,6 @@ class BED:
             "design": "policy",
             "infer": "posterior",
             "predict": "predictor",
-            "infer_design": "joint_infer_design",
-            "design_predict": "joint_design_predict",
-            "design_infer_predict": "joint_design_infer_predict",
             "log_prob": "likelihood",
             "candidates": "candidate_pool",
         }
@@ -567,7 +626,7 @@ class BED:
             if hasattr(prior, "sample")
             else self.invoke(prior, n, generator=generator, **context)
         )
-        theta = draw.theta if isinstance(draw, Batch) else draw
+        theta = draw.parameters if isinstance(draw, Batch) else draw
         spec = self._spec("theta", "theta")
         if spec is not None:
             spec.check(theta, "theta")
@@ -605,18 +664,42 @@ class BED:
             return self.invoke(self.candidate_pool, history, env=self, **context)
         return self.candidate_pool
 
-    def design(self, history: Batch | None = None, **context: Any) -> Array | PolicySample:
-        """Take a history and return the next design or sampled-policy details."""
+    def design(
+        self,
+        history: Batch | None = None,
+        *,
+        infer: bool = False,
+        predict: bool = False,
+        query: Any = None,
+        **context: Any,
+    ) -> Result:
+        """Take a history and output flags and return a model-result dictionary."""
         if self.policy is None:
             raise RuntimeError("No policy is attached; use env.with_components(design=policy)")
         if "candidates" not in context:
             context["candidates"] = self.candidates(history, **context)
-        result = self.invoke(self.policy, history, env=self, **context)
-        x = result.x if isinstance(result, PolicySample) else result
+        output = result(
+            self.invoke(
+                self.policy,
+                history,
+                infer=infer,
+                predict=predict,
+                query=query,
+                env=self,
+                **context,
+            ),
+            primary="design",
+        )
+        chosen = output["design"]
+        x = chosen.x if isinstance(chosen, PolicySample) else chosen
         spec = self._spec("x", "design")
-        if spec is not None:
+        if spec is not None and x is not None:
             spec.check(x, "x")
-        return result
+        if infer and output["infer"] is None and self.posterior is not None:
+            output["infer"] = self.infer(history)["infer"]
+        if predict and output["predict"] is None and self.predictor is not None:
+            output["predict"] = self.predict(x if query is None else query, history)["predict"]
+        return output
 
     def infer(
         self,
@@ -626,72 +709,34 @@ class BED:
         mask: Array | None = None,
         target: Any = None,
         **context: Any,
-    ) -> Any:
-        """Take a history or ``x,y`` arrays and return any chosen inference representation."""
+    ) -> Result:
+        """Take a history or observation arrays and return an inference result dictionary."""
         if self.posterior is None:
             raise RuntimeError("No posterior is attached; use env.with_components(infer=posterior)")
         if isinstance(history, Observation):
             history = Batch(o=history, mask=mask, target=target)
         elif not isinstance(history, Batch):
             history = Batch(theta=None, x=history, y=y, mask=mask, target=target)
-        return self.invoke(self.posterior, history, env=self, **context)
+        return result(self.invoke(self.posterior, history, env=self, **context), primary="infer")
 
-    def predict(self, query: Any = None, history: Batch | None = None, **context: Any) -> Any:
-        """Take an optional query and history and return the model's prediction."""
+    def predict(
+        self,
+        query: Any = None,
+        history: Batch | None = None,
+        *,
+        infer: bool = False,
+        **context: Any,
+    ) -> Result:
+        """Take a query, history, and inference flag and return a model-result dictionary."""
         if self.predictor is None:
             raise RuntimeError("No predictor is attached; use env.with_components(predict=predictor)")
-        return self.invoke(self.predictor, query, history, env=self, **context)
-
-    def _joint_context(self, history: Batch | None, context: dict[str, Any]) -> dict[str, Any]:
-        """Take a history and call context and return context containing any design candidates."""
-        if "candidates" not in context:
-            context["candidates"] = self.candidates(history, **context)
-        return context
-
-    def infer_design(self, history: Batch, **context: Any) -> tuple[Any, Array | PolicySample]:
-        """Take a history and return inference first and the next design second."""
-        if self.joint_infer_design is not None:
-            return self.invoke(self.joint_infer_design, history, env=self, **self._joint_context(history, context))
-        if self.joint_design_infer_predict is not None:
-            design, inference, _ = self.design_infer_predict(history, **context)
-            return inference, design
-        return self.infer(history, **context), self.design(history, **context)
-
-    def design_predict(self, history: Batch, query: Any = None, **context: Any) -> tuple[Array | PolicySample, Any]:
-        """Take a history and optional query and return the next design first and prediction second."""
-        if self.joint_design_predict is not None:
-            return self.invoke(
-                self.joint_design_predict, history, query=query, env=self, **self._joint_context(history, context)
-            )
-        if self.joint_design_infer_predict is not None:
-            design, _, prediction = self.design_infer_predict(history, query=query, **context)
-            return design, prediction
-        design = self.design(history, **context)
-        x = design.x if isinstance(design, PolicySample) else design
-        return design, self.predict(x if query is None else query, history, **context)
-
-    def design_infer_predict(
-        self, history: Batch, query: Any = None, **context: Any
-    ) -> tuple[Array | PolicySample, Any, Any]:
-        """Take a history and optional query and return design, inference, and prediction in that order."""
-        if self.joint_design_infer_predict is not None:
-            return self.invoke(
-                self.joint_design_infer_predict,
-                history,
-                query=query,
-                env=self,
-                **self._joint_context(history, context),
-            )
-        if self.joint_infer_design is not None:
-            inference, design = self.infer_design(history, **context)
-            x = design.x if isinstance(design, PolicySample) else design
-            return design, inference, self.predict(x if query is None else query, history, **context)
-        if self.joint_design_predict is not None:
-            design, prediction = self.design_predict(history, query=query, **context)
-            return design, self.infer(history, **context), prediction
-        design = self.design(history, **context)
-        x = design.x if isinstance(design, PolicySample) else design
-        return design, self.infer(history, **context), self.predict(x if query is None else query, history, **context)
+        output = result(
+            self.invoke(self.predictor, query, history, infer=infer, env=self, **context),
+            primary="predict",
+        )
+        if infer and output["infer"] is None and self.posterior is not None:
+            output["infer"] = self.infer(history)["infer"]
+        return output
 
     def log_prob(self, y: Array, theta: Array, x: Array | None = None, **context: Any) -> Array:
         """Take an outcome, parameters, and optional design and return the observation log density."""
@@ -715,12 +760,12 @@ class BED:
         seed: int = 0,
         epoch: int = 0,
         budget: int | None = None,
-        x: Array | None = None,
+        designs: Array | None = None,
     ) -> Any:
         """Take rollout settings and return a finite generated dataset."""
         from .data import Stream
 
-        return Stream(self, episodes, seed=seed, budget=budget).generate(policy, epoch=epoch, x=x)
+        return Stream(self, episodes, seed=seed, budget=budget).generate(policy, epoch=epoch, designs=designs)
 
     def dataloader(
         self,
@@ -754,9 +799,6 @@ class BED:
                 ("design", self.policy),
                 ("infer", self.posterior),
                 ("predict", self.predictor),
-                ("infer_design", self.joint_infer_design),
-                ("design_predict", self.joint_design_predict),
-                ("design_infer_predict", self.joint_design_infer_predict),
             )
             if value
         ]
@@ -764,30 +806,30 @@ class BED:
         return "\n".join(rows)
 
 
-REGISTRY: dict[str, Callable[..., BED]] = {}
+_ENVIRONMENTS: dict[str, Callable[..., BED]] = {}
 
 
-def register(name: str, factory: Callable[..., BED], *, overwrite: bool = False) -> None:
-    """Take a name and environment factory and add them to the registry."""
-    if name in REGISTRY and not overwrite:
-        raise KeyError(f"{name!r} is already registered")
-    REGISTRY[name] = factory
+def _add_environment(name: str, factory: Callable[..., BED]) -> None:
+    """Take a name and factory and add one environment to PyBED's built-in list."""
+    if name in _ENVIRONMENTS:
+        raise KeyError(f"{name!r} is already available")
+    _ENVIRONMENTS[name] = factory
 
 
 def make(name: str, **cfg: Any) -> BED:
-    """Take a registered name and settings and return the requested environment."""
-    if not REGISTRY:
+    """Take an environment name and settings and return the requested environment."""
+    if not _ENVIRONMENTS:
         from . import envs  # noqa: F401
-    if name not in REGISTRY:
-        raise KeyError(f"Unknown environment {name!r}; available: {available()}")
-    return REGISTRY[name](**cfg)
+    if name not in _ENVIRONMENTS:
+        raise KeyError(f"Unknown environment {name!r}; available: {environments()}")
+    return _ENVIRONMENTS[name](**cfg)
 
 
-def available() -> tuple[str, ...]:
-    """Return the registered environment names in sorted order."""
-    if not REGISTRY:
+def environments() -> tuple[str, ...]:
+    """Return the names of PyBED's built-in environments."""
+    if not _ENVIRONMENTS:
         from . import envs  # noqa: F401
-    return tuple(sorted(REGISTRY))
+    return tuple(sorted(_ENVIRONMENTS))
 
 
 Particles = ParticleCloud

@@ -21,7 +21,7 @@ def convert(value: Any, backend: str = "torch", *, device: str | torch.device = 
     """
     if isinstance(value, Batch):
         fields: dict[str, Any] = {}
-        for name in ("theta", "x", "y", "mask", "target", "belief"):
+        for name in ("parameters", "designs", "outcomes", "mask", "target", "belief"):
             item = getattr(value, name)
             fields[name] = None if item is None else convert(item, backend, device=device)
         fields["context"] = convert(value.context, backend, device=device)

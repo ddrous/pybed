@@ -13,11 +13,11 @@ def test_environment_summary_and_component_replacement():
         """Take parameters and designs and return zero outcomes."""
         return torch.zeros((*theta.shape[:-2], 1))
 
-    custom = env.with_components(simulate=exact, infer=lambda history: history.theta)
+    custom = env.with_components(simulate=exact, infer=lambda history: history.parameters)
     theta = custom.sample_prior(4, seed=2)
     x = torch.full((4, 2), 0.5)
     assert torch.equal(custom.simulate(theta, x), torch.zeros(4, 1))
-    assert torch.equal(custom.infer(pb.Batch(theta)), theta)
+    assert torch.equal(custom.infer(pb.Batch(parameters=theta))["infer"], theta)
     assert env.posterior is None
 
 
@@ -51,15 +51,18 @@ def test_registry_contains_builtins():
         "mnist-classification-v0",
         "advdiff-v0",
         "pendulum-v0",
-    }.issubset(pb.available())
+    }.issubset(pb.environments())
 
 
-def test_observation_aliases_and_joint_verbs():
-    """Check observation aliases and each joint-call return order."""
+def test_observation_aliases_and_model_results():
+    """Check the readable batch aliases and shared model-result dictionaries."""
     x, y = torch.ones(2, 1), torch.zeros(2, 1)
-    batch = pb.Batch(theta=torch.zeros(2, 1), design=x, outcome=y)
-    assert batch.x is batch.design and batch.y is batch.outcome
-    assert batch.obs.x is x and batch.o.y is y
+    theta = torch.zeros(2, 1)
+    batch = pb.Batch(parameters=theta, designs=x, outcomes=y)
+    assert batch.parameters is batch.theta is batch.thetas
+    assert batch.designs is batch.design is batch.x
+    assert batch.outcomes is batch.outcome is batch.y
+    assert batch.obs.design is x and batch.o.outcome is y
 
     env = pb.BED(
         "joint",
@@ -71,24 +74,32 @@ def test_observation_aliases_and_joint_verbs():
         infer=lambda history: "inference",
         predict=lambda query, history: "prediction",
     )
-    assert env.infer_design(batch) == ("inference", x)
-    assert env.design_predict(batch) == (x, "prediction")
-    assert env.design_infer_predict(batch) == (x, "inference", "prediction")
+    output = env.design(batch, infer=True, predict=True)
+    assert output == {"design": x, "infer": "inference", "predict": "prediction"}
+    assert env.infer(batch) == {"design": None, "infer": "inference", "predict": None}
+    assert env.predict(x, batch, infer=True) == {
+        "design": None,
+        "infer": "inference",
+        "predict": "prediction",
+    }
 
-    pair_env = env.with_components(infer=lambda history: history.o)
+    pair_env = env.with_components(infer=lambda history: history.obs)
     inferred_o = pair_env.infer(pb.Observation(x, y))
-    assert inferred_o.x is x and inferred_o.y is y
+    assert inferred_o["infer"].design is x and inferred_o["infer"].outcome is y
 
-    one_pass = env.with_components(
-        design_infer_predict=lambda history: (x + 1, "joint inference", "joint prediction")
-    )
-    result = one_pass.design_infer_predict(batch)
-    assert torch.equal(result[0], x + 1)
-    assert result[1:] == ("joint inference", "joint prediction")
-    inference, design = one_pass.infer_design(batch)
-    assert inference == "joint inference" and torch.equal(design, x + 1)
-    design, prediction = one_pass.design_predict(batch)
-    assert torch.equal(design, x + 1) and prediction == "joint prediction"
+    def shared(history, infer=False, predict=False):
+        """Take a history and flags and return all requested outputs in one pass."""
+        return {
+            "design": x + 1,
+            "infer": "shared inference" if infer else None,
+            "predict": "shared prediction" if predict else None,
+        }
+
+    one_pass = env.with_components(design=shared)
+    combined = one_pass.design(batch, infer=True, predict=True)
+    assert torch.equal(combined["design"], x + 1)
+    assert combined["infer"] == "shared inference"
+    assert combined["predict"] == "shared prediction"
 
 
 def test_particle_cloud_statistics():

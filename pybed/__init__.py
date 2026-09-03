@@ -1,10 +1,10 @@
 """PyBED: small, composable building blocks for Bayesian experimental design.
 
-The public surface is intentionally narrow.  Most projects need only ``make`` or
-``BED`` plus the ``data``, ``exp``, ``metrics``, ``sim`` and ``vs`` modules.
+The public surface is intentionally narrow. Most projects need only ``make`` or
+``BED`` plus the ``data``, ``expt``, ``metrics``, ``sim`` and ``vis`` modules.
 """
 
-from . import backends, data, envs, exp, metrics, sim, vs
+from . import backends, data, envs, expt, metrics, sim, vis
 from .core import (
     BED,
     Batch,
@@ -16,15 +16,12 @@ from .core import (
     PolicySample,
     Spec,
     Uniform,
-    available,
+    environments,
     make,
-    register,
 )
 
 __all__ = [
     "BED",
-    "BEDEnv",
-    "BEDEnvironment",
     "Batch",
     "EmpiricalPrior",
     "Normal",
@@ -34,22 +31,15 @@ __all__ = [
     "PolicySample",
     "Spec",
     "Uniform",
-    "available",
+    "environments",
     "make",
-    "register",
     "backends",
     "data",
     "envs",
-    "exp",
+    "expt",
     "metrics",
     "sim",
-    "vs",
-    "visualisers",
+    "vis",
 ]
 
 __version__ = "0.2.0"
-
-# These longer spellings remain available for existing notebooks.
-BEDEnv = BED
-BEDEnvironment = BED
-visualisers = vs

@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from .core import BED, Batch, ParticleCloud, PolicySample
+from .core import BED, Batch, ParticleCloud, PolicySample, result
 
 
 class Seeds:
@@ -63,9 +63,9 @@ class EpisodeDataset(Dataset[Batch]):
     """Store a finite batch of paired parameters and outcomes."""
 
     def __init__(self, batch: Batch):
-        """Take a Batch with theta and y and expose its rows as a dataset."""
-        if batch.theta is None or batch.y is None:
-            raise ValueError("An episode dataset requires theta and y; x is optional")
+        """Take a batch with parameters and outcomes and expose its rows as a dataset."""
+        if batch.parameters is None or batch.outcomes is None:
+            raise ValueError("An episode dataset requires parameters and outcomes; designs are optional")
         self.batch = batch
 
     def __len__(self) -> int:
@@ -81,19 +81,19 @@ class EpisodeDataset(Dataset[Batch]):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "theta": self.batch.theta,
-            "x": self.batch.x,
-            "y": self.batch.y,
+            "parameters": self.batch.parameters,
+            "designs": self.batch.designs,
+            "outcomes": self.batch.outcomes,
             "mask": self.batch.mask,
             "target": self.batch.target,
             "belief": self.batch.belief,
             "context": self.batch.context,
             "meta": self.batch.meta,
-            "format": "pybed-episodes-v2",
+            "format": "pybed-episodes",
         }
         torch.save(payload, path)
         manifest = {
-            "format": "pybed-episodes-v2",
+            "format": "pybed-episodes",
             "episodes": len(self),
             "shapes": {
                 name: list(value.shape)
@@ -109,18 +109,13 @@ class EpisodeDataset(Dataset[Batch]):
     def load(cls, path: str | Path, *, map_location: str | torch.device = "cpu") -> EpisodeDataset:
         """Take a saved dataset path and return the restored EpisodeDataset."""
         payload = torch.load(Path(path), map_location=map_location, weights_only=False)
-        version = payload.get("format")
-        if version not in {"pybed-episodes-v1", "pybed-episodes-v2"}:
+        if payload.get("format") != "pybed-episodes":
             raise ValueError("Not a supported PyBED episode file")
-        if version == "pybed-episodes-v1":
-            x, y = payload.get("design"), payload.get("obs")
-        else:
-            x, y = payload.get("x"), payload.get("y")
         return cls(
             Batch(
-                theta=payload["theta"],
-                x=x,
-                y=y,
+                parameters=payload["parameters"],
+                designs=payload.get("designs"),
+                outcomes=payload["outcomes"],
                 mask=payload.get("mask"),
                 target=payload.get("target"),
                 belief=payload.get("belief"),
@@ -133,9 +128,9 @@ class EpisodeDataset(Dataset[Batch]):
 def collate(items: list[Batch]) -> Batch:
     """Take individual Batch records and return one stacked Batch."""
     return Batch(
-        theta=_stack([item.theta for item in items]),
-        x=_stack([item.x for item in items]),
-        y=_stack([item.y for item in items]),
+        parameters=_stack([item.parameters for item in items]),
+        designs=_stack([item.designs for item in items]),
+        outcomes=_stack([item.outcomes for item in items]),
         mask=_stack([item.mask for item in items]),
         target=_stack([item.target for item in items]),
         belief=_stack([item.belief for item in items]),
@@ -228,14 +223,14 @@ def _expand_time(value: Any, episodes: int, budget: int) -> Any:
     return value
 
 
-def _fixed_x(x: Any, episodes: int, budget: int, event_shape: tuple[int | None, ...]) -> torch.Tensor:
+def _fixed_designs(designs: Any, episodes: int, budget: int, event_shape: tuple[int | None, ...]) -> torch.Tensor:
     """Take shared or per-episode designs and return one batched design sequence."""
-    value = torch.as_tensor(x)
+    value = torch.as_tensor(designs)
     event_ndim = len(event_shape)
     if value.ndim == event_ndim + 1:
         value = value[None, ...].expand(episodes, *value.shape)
     if value.ndim != event_ndim + 2 or value.shape[0] != episodes:
-        raise ValueError("x must have shape (steps, *x_shape) or (episodes, steps, *x_shape)")
+        raise ValueError("designs must have shape (steps, *design_shape) or (episodes, steps, *design_shape)")
     if value.shape[1] != budget:
         raise ValueError(f"x contains {value.shape[1]} steps but this Stream has budget={budget}")
     return value
@@ -256,14 +251,19 @@ class Stream:
         if epoch not in self._draw_cache:
             generator = self.seeds.torch(f"{self.env.name}:theta", epoch)
             draw = self.env.sample_prior(self.episodes, generator=generator, epoch=epoch)
-            batch = draw if isinstance(draw, Batch) else Batch(theta=torch.as_tensor(draw))
+            batch = draw if isinstance(draw, Batch) else Batch(parameters=torch.as_tensor(draw))
             self._draw_cache[epoch] = batch.detach()
         cached = self._draw_cache[epoch]
-        return Batch(theta=cached.theta.clone(), context=cached.context, target=cached.target, belief=cached.belief)
+        return Batch(
+            parameters=cached.parameters.clone(),
+            context=cached.context,
+            target=cached.target,
+            belief=cached.belief,
+        )
 
-    def theta(self, epoch: int = 0) -> torch.Tensor:
+    def parameters(self, epoch: int = 0) -> torch.Tensor:
         """Take an epoch number and return a copy of its latent parameters."""
-        return torch.as_tensor(self.draw(epoch).theta).clone()
+        return torch.as_tensor(self.draw(epoch).parameters).clone()
 
     def _random_sequence(self, epoch: int) -> torch.Tensor:
         """Take an epoch number and return all random non-adaptive designs at once."""
@@ -288,7 +288,7 @@ class Stream:
 
     def _vectorized(self, draw: Batch, x: torch.Tensor | None, epoch: int, common_noise: bool) -> Batch:
         """Take prior draws and fixed designs and return one vectorized simulator batch."""
-        theta = torch.as_tensor(draw.theta)
+        theta = torch.as_tensor(draw.parameters)
         context = draw.context
         if x is None:
             y = self.env.simulate(
@@ -315,9 +315,9 @@ class Stream:
             else draw.target if draw.target is not None else theta
         )
         return Batch(
-            theta=theta,
-            x=x,
-            y=torch.as_tensor(y),
+            parameters=theta,
+            designs=x,
+            outcomes=torch.as_tensor(y),
             mask=mask,
             target=target,
             belief=draw.belief,
@@ -331,37 +331,31 @@ class Stream:
         epoch: int = 0,
         common_noise: bool = True,
         save: str | Path | None = None,
-        x: Any = None,
+        designs: Any = None,
+        infer: bool = False,
+        predict: bool = False,
     ) -> EpisodeDataset:
-        """Take a policy or fixed designs and return a generated EpisodeDataset."""
+        """Take rollout choices and return a generated episode dataset."""
         draw = self.draw(epoch)
         x_spec = self.env._spec("x", "design")
-        has_joint = any(
-            component is not None
-            for component in (
-                self.env.joint_infer_design,
-                self.env.joint_design_predict,
-                self.env.joint_design_infer_predict,
-            )
-        )
         can_vectorize = (
             policy is None
             and self.env.vectorized
-            and not has_joint
             and self.env.policy is None
             and not callable(self.env.candidate_pool)
         )
-        if x is not None:
+        x = designs
+        if designs is not None:
             if x_spec is None:
-                raise ValueError("Fixed x was supplied to an environment without a design space")
-            x = _fixed_x(x, self.episodes, self.budget, x_spec.shape)
+                raise ValueError("Fixed designs were supplied to an environment without a design space")
+            x = _fixed_designs(designs, self.episodes, self.budget, x_spec.shape)
             can_vectorize = self.env.vectorized
         elif can_vectorize and x_spec is not None:
             x = self._random_sequence(epoch)
         if can_vectorize or x_spec is None:
             batch = self._vectorized(draw, x, epoch, common_noise)
         else:
-            batch = self._sequential(draw, policy, epoch, common_noise)
+            batch = self._sequential(draw, policy, epoch, common_noise, infer, predict)
         batch.meta.update(epoch=epoch, seed=self.seed, budget=self.budget, episodes=self.episodes)
         dataset = EpisodeDataset(batch.detach())
         if save is not None:
@@ -374,21 +368,24 @@ class Stream:
         policy: Callable[..., Any] | None,
         epoch: int,
         common_noise: bool,
+        infer: bool,
+        predict: bool,
     ) -> Batch:
         """Take prior draws and an adaptive policy and return their sequential rollout."""
-        theta = torch.as_tensor(draw.theta)
+        theta = torch.as_tensor(draw.parameters)
         xs: list[torch.Tensor] = []
         ys: list[torch.Tensor] = []
         log_probs: list[torch.Tensor] = []
         entropies: list[torch.Tensor] = []
         belief = draw.belief
+        inference: Any = None
         prediction: Any = None
         mask = torch.ones((self.episodes, self.budget), dtype=torch.bool)
         for step in range(self.budget):
             history = Batch(
-                theta=theta,
-                x=None if not xs else torch.stack(xs, 1),
-                y=None if not ys else torch.stack(ys, 1),
+                parameters=theta,
+                designs=None if not xs else torch.stack(xs, 1),
+                outcomes=None if not ys else torch.stack(ys, 1),
                 mask=mask[:, :step],
                 target=draw.target,
                 belief=belief,
@@ -401,26 +398,32 @@ class Stream:
                 batch_size=self.episodes,
             )
             if policy is not None:
-                result = self.env.invoke(
-                    policy,
-                    history,
-                    env=self.env,
-                    candidates=self.env.candidates(history, epoch=epoch, step=step),
-                    **call_context,
+                output = result(
+                    self.env.invoke(
+                        policy,
+                        history,
+                        infer=infer,
+                        predict=predict,
+                        env=self.env,
+                        candidates=self.env.candidates(history, epoch=epoch, step=step),
+                        **call_context,
+                    ),
+                    primary="design",
                 )
-            elif self.env.joint_design_infer_predict is not None:
-                result, inference, prediction = self.env.design_infer_predict(history, **call_context)
-                belief = inference if isinstance(inference, ParticleCloud) else belief
-            elif self.env.joint_infer_design is not None:
-                inference, result = self.env.infer_design(history, **call_context)
-                belief = inference if isinstance(inference, ParticleCloud) else belief
-            elif self.env.joint_design_predict is not None:
-                result, prediction = self.env.design_predict(history, **call_context)
             elif self.env.policy is not None:
-                result = self.env.design(history, **call_context)
+                output = self.env.design(history, infer=infer, predict=predict, **call_context)
             else:
-                result = random_policy(history, env=self.env, **call_context)
-            sample = result if isinstance(result, PolicySample) else PolicySample(torch.as_tensor(result))
+                output = result(random_policy(history, env=self.env, **call_context), primary="design")
+            if output["infer"] is not None:
+                inference = output["infer"]
+            if output["predict"] is not None:
+                prediction = output["predict"]
+            if isinstance(inference, ParticleCloud):
+                belief = inference
+            chosen = output["design"]
+            if chosen is None:
+                raise RuntimeError("The design call did not return a design")
+            sample = chosen if isinstance(chosen, PolicySample) else PolicySample(torch.as_tensor(chosen))
             current_x = torch.as_tensor(sample.x)
             if sample.log_prob is not None:
                 log_probs.append(torch.as_tensor(sample.log_prob))
@@ -448,11 +451,13 @@ class Stream:
         if entropies:
             context["entropy"] = torch.stack(entropies, 1)
         if prediction is not None:
-            context["prediction"] = prediction
+            context["predict"] = prediction
+        if inference is not None and not isinstance(inference, ParticleCloud):
+            context["infer"] = inference
         return Batch(
-            theta=theta,
-            x=torch.stack(xs, 1),
-            y=torch.stack(ys, 1),
+            parameters=theta,
+            designs=torch.stack(xs, 1),
+            outcomes=torch.stack(ys, 1),
             mask=mask,
             target=target,
             belief=belief,
@@ -508,7 +513,3 @@ class ReplayBuffer:
 def load(path: str | Path, **kwargs: Any) -> EpisodeDataset:
     """Take a saved dataset path and return the restored EpisodeDataset."""
     return EpisodeDataset.load(path, **kwargs)
-
-
-SeedBank = Seeds
-EpochStream = Stream

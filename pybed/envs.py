@@ -11,8 +11,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import sim, vs
-from .core import BED, Batch, Normal, Spec, Uniform, register
+from . import sim, vis
+from .core import BED, Batch, Normal, Spec, Uniform, _add_environment
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,7 @@ class VariableLocationPrior:
         theta_mask = source_mask[:, :, None] & dimension_mask[:, None, :]
         theta = torch.where(theta_mask, theta, 0)
         return Batch(
-            theta=theta,
+            parameters=theta,
             context={
                 "num_sources": num_sources,
                 "source_dim": source_dim,
@@ -194,7 +194,7 @@ def location(
         },
         budget=budget,
         likelihood=likelihood,
-        visualizers={"episode": vs.location, "prior": vs.prior},
+        visualizers={"episode": vis.location, "prior": vis.prior},
         cfg=dict(
             sources=source_counts[0] if len(source_counts) == 1 else source_counts,
             dims=dimensions[0] if len(dimensions) == 1 else dimensions,
@@ -257,7 +257,7 @@ def mnist(
             "y": Spec((channels, height, width)),
         },
         budget=budget,
-        visualizers={"episode": vs.image_discovery, "prior": vs.prior},
+        visualizers={"episode": vis.image_discovery, "prior": vis.prior},
         cfg=dict(
             image_shape=(channels, height, width),
             half_width=half_width,
@@ -281,7 +281,7 @@ class ImageLabelPrior:
         count = int(np.prod(shape)) if shape else 1
         indices = torch.randint(len(self.images), (count,), generator=generator)
         return Batch(
-            theta=self.images[indices].reshape(*shape, *self.images.shape[1:]),
+            parameters=self.images[indices].reshape(*shape, *self.images.shape[1:]),
             target=self.labels[indices].reshape(*shape),
         )
 
@@ -345,7 +345,7 @@ def mnist_classification(
         },
         budget=budget,
         likelihood=likelihood,
-        visualizers={"episode": vs.image_classification, "prior": vs.prior},
+        visualizers={"episode": vis.image_classification, "prior": vis.prior},
         cfg=dict(image_shape=(channels, height, width), classes=10, patch_size=patch_size, noise=noise),
     )
 
@@ -390,7 +390,7 @@ def advdiff(
             "y": Spec((sensors, len(times)), labels=tuple(f"t={t:g}" for t in times)),
         },
         budget=budget,
-        visualizers={"episode": vs.pde, "prior": vs.prior},
+        visualizers={"episode": vis.pde, "prior": vis.prior},
         cfg=dict(
             shape=shape,
             sensors=sensors,
@@ -439,7 +439,7 @@ def pendulum(
             "y": Spec((steps // keep_every + 1,), labels=("angle time series",)),
         },
         budget=budget,
-        visualizers={"episode": vs.timeseries, "prior": vs.prior},
+        visualizers={"episode": vis.timeseries, "prior": vis.prior},
         cfg=dict(dt=dt, steps=steps, keep_every=keep_every, process_noise=process_noise, obs_noise=obs_noise),
     )
 
@@ -459,7 +459,7 @@ def ces(*, goods: int = 3, budget: int = 20, noise: float = 0.05) -> BED:
         simulator,
         specs={"theta": Spec((goods + 2,)), "x": Spec((2 * goods,), low=0, high=100), "y": Spec((1,))},
         budget=budget,
-        visualizers={"episode": vs.timeseries, "prior": vs.prior},
+        visualizers={"episode": vis.timeseries, "prior": vis.prior},
         cfg=dict(goods=goods, noise=noise),
     )
 
@@ -478,7 +478,7 @@ def death(*, population: int = 50, budget: int = 4, max_time: float = 5.0) -> BE
         simulator,
         specs={"theta": Spec((1,), low=0), "x": Spec((1,), low=0, high=max_time), "y": Spec((1,))},
         budget=budget,
-        visualizers={"episode": vs.timeseries, "prior": vs.prior},
+        visualizers={"episode": vis.timeseries, "prior": vis.prior},
         cfg=dict(population=population, max_time=max_time),
     )
 
@@ -513,4 +513,4 @@ for env_name, factory in {
     "ces-v0": ces,
     "death-v0": death,
 }.items():
-    register(env_name, factory)
+    _add_environment(env_name, factory)

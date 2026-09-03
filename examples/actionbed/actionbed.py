@@ -1,14 +1,11 @@
 # %% ACTION-BED for source location finding (Rossa, Phillips & Rainforth, 2026)
 """Paper-faithful, single-file ACTION-BED example.
 
-This learns a deterministic design policy and a terminal point-estimation policy
-directly from expected future loss--there is deliberately no posterior model.
-The paper settings are the defaults; set ``PYBED_QUICK=1`` for a smoke test.
+This learns a design policy and a final point estimate directly from expected
+future loss. See config.yaml in the DAD example for paper settings.
 """
 
-import os
-import sys
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 import matplotlib.pyplot as plt
 import torch
@@ -17,9 +14,11 @@ from torch import nn
 from tqdm.auto import tqdm
 import pybed as pb
 
+DEBUG = False
 
 @dataclass(frozen=True)
 class Config:
+    """Training, evaluation, and saved-model settings."""
     seed: int = 42
     sources: int = 2
     budget: int = 30
@@ -29,21 +28,18 @@ class Config:
     learning_rate: float = 5e-4
     decay: float = 0.95
     decay_period: int = 2_000
-    objective: str = "log_mse"  # "mse" or "log_mse"
+    objective: str = "log_mse"
     eval_episodes: int = 2_048
     log_every: int = 100
     runs: str = "runs"
+    checkpoint: str | None = None
 
 
+# %% Setup
 cfg = Config()
-if os.getenv("PYBED_QUICK") == "1":
-    cfg = replace(cfg, budget=4, batch_size=16, warmup_steps=2, joint_steps=3, eval_episodes=16, log_every=1)
-
-pb.exp.seed(cfg.seed, deterministic=False)
-# Clear strict determinism if an earlier notebook cell enabled it; attention uses
-# PyTorch's default backend selection for the installed hardware and build.
+pb.expt.seed(cfg.seed, deterministic=False)
 torch.use_deterministic_algorithms(False)
-pb.vs.style()
+pb.vis.style()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 prior = pb.Normal(torch.zeros(cfg.sources, 2), torch.ones(cfg.sources, 2))
 env = pb.make(
@@ -61,7 +57,13 @@ env = pb.make(
     log_signal=True,
 )
 seeds = pb.data.Seeds(cfg.seed)
-run = pb.exp.Run.create(cfg.runs, "actionbed", asdict(cfg), seed_value=cfg.seed)
+run = pb.expt.Run.create(
+    cfg.runs,
+    "actionbed",
+    asdict(cfg),
+    seed_value=cfg.seed,
+    source_files=[__file__],
+)
 
 
 # %% TNP-like deterministic design policy from Appendix E.1
@@ -85,10 +87,10 @@ class DesignPolicy(nn.Module):
     def forward(self, history: pb.Batch) -> torch.Tensor:
         """Take an observation history and return the next two-dimensional design."""
         batch = len(history)
-        steps = 0 if history.x is None else history.x.shape[1]
+        steps = 0 if history.designs is None else history.designs.shape[1]
         if steps:
-            x = self.design_encoder(history.x)
-            y = self.outcome_encoder(history.y)
+            x = self.design_encoder(history.designs)
+            y = self.outcome_encoder(history.outcomes)
             tokens = self.adapter(self.pair(torch.cat((x, y), -1)))
             times = self.time(torch.arange(steps, device=tokens.device))[None]
             tokens = tokens + self.history_type + times
@@ -117,7 +119,7 @@ class ActionPolicy(nn.Module):
 
     def forward(self, history: pb.Batch) -> torch.Tensor:
         """Take a complete history and return estimated source locations."""
-        pairs = torch.cat((history.x, history.y), -1).flatten(1)
+        pairs = torch.cat((history.designs, history.outcomes), -1).flatten(1)
         return self.net(pairs).reshape(len(history), self.sources, 2)
 
 
@@ -130,6 +132,9 @@ class ActionBED(nn.Module):
 
 
 model = ActionBED().to(device)
+if cfg.checkpoint:
+    saved = torch.load(cfg.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(saved.get("model", saved))
 
 
 def sample_truth(stage: str, step: int) -> torch.Tensor:
@@ -140,7 +145,7 @@ def sample_truth(stage: str, step: int) -> torch.Tensor:
 
 def rollout(theta: torch.Tensor, step: int, *, random: bool) -> pb.Batch:
     """Take source locations and return their random or learned observation history."""
-    history = pb.Batch(theta=theta, x=None, y=None, mask=None)
+    history = pb.Batch(parameters=theta, designs=None, outcomes=None, mask=None)
     xs, ys = [], []
     for time in range(cfg.budget):
         if random:
@@ -154,7 +159,12 @@ def rollout(theta: torch.Tensor, step: int, *, random: bool) -> pb.Batch:
         )
         xs.append(x)
         ys.append(y)
-        history = pb.Batch(theta=theta, x=torch.stack(xs, 1), y=torch.stack(ys, 1), mask=None)
+        history = pb.Batch(
+            parameters=theta,
+            designs=torch.stack(xs, 1),
+            outcomes=torch.stack(ys, 1),
+            mask=None,
+        )
     return history
 
 
@@ -230,10 +240,10 @@ evaluation = pb.data.Stream(env, cfg.eval_episodes, seed=cfg.seed + 1, budget=cf
 with torch.no_grad():
     batch = evaluation.batch.to(device)
     estimate = model.action_policy(batch)
-    direct = (estimate - batch.theta).square().mean((-1, -2))
-    swapped = (estimate - batch.theta.flip(1)).square().mean((-1, -2))
+    direct = (estimate - batch.parameters).square().mean((-1, -2))
+    swapped = (estimate - batch.parameters.flip(1)).square().mean((-1, -2))
     set_mse = torch.minimum(direct, swapped)
-    ordered_error = (estimate - canonical(batch.theta)).square().sum((-1, -2))
+    ordered_error = (estimate - canonical(batch.parameters)).square().sum((-1, -2))
     results = {
         "set_mse": float(set_mse.mean()),
         "log_mse": float(torch.log(ordered_error + 1e-6).mean()),
@@ -241,7 +251,7 @@ with torch.no_grad():
     }
 
 print(results)
-training_fig, _ = pb.vs.training(records, keys=("loss",), logy=False)
+training_fig, _ = pb.vis.training(records, keys=("loss",), logy=False)
 trajectory_fig, _ = env.visualize("episode", evaluation.batch, index=0)
 run.save_figure(training_fig, "training")
 run.save_figure(trajectory_fig, "trajectory")

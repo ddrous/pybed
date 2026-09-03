@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -20,33 +20,20 @@ try:
 except ImportError as error:
     raise ImportError("Install this example with `pip install -e '.[lightning]'`") from error
 
-
-QUICK = os.getenv("PYBED_QUICK", "0") == "1"
-
+# Specify path to config.yaml; if not present, load from script folder
+CONFIG_PATH: str | None = None
+DEBUG = False
 
 @dataclass(frozen=True)
 class Config:
-    """Hold the settings consumed by the example and produce no output on its own."""
-
+    """Settings for the example."""
     seed: int = 2030
-    budget: int = 3 if QUICK else 10
-    train_episodes: int = 64 if QUICK else 16_384
-    eval_episodes: int = 16 if QUICK else 512
-    contrastives: int = 3 if QUICK else 31
-    batch_size: int = 16 if QUICK else 256
-    epochs: int = 1 if QUICK else 100
-    learning_rate: float = 3e-4
-    devices: int = int(os.getenv("PYBED_DEVICES", "1"))
-    runs: str = os.getenv("PYBED_RUNS", "runs")
-    wandb_project: str = os.getenv("WANDB_PROJECT", "pybed-dad")
-    wandb_mode: str = os.getenv("WANDB_MODE", "offline")
 
 
 class DesignPolicy(nn.Module):
-    """Map a set of past observation pairs to the next bounded design."""
-
+    """Map past observation pairs to the next bounded design."""
     def __init__(self, low: float, high: float):
-        """Take design bounds and create the history encoder and output head."""
+        """Create history encoder and output head."""
         super().__init__()
         self.low, self.high = low, high
         self.pair = nn.Sequential(nn.Linear(3, 128), nn.ReLU(), nn.Linear(128, 64), nn.ReLU())
@@ -54,27 +41,26 @@ class DesignPolicy(nn.Module):
         self.head = nn.Sequential(nn.Linear(64, 128), nn.ReLU(), nn.Linear(128, 2))
 
     def forward(self, history: pb.Batch) -> torch.Tensor:
-        """Take a Batch history and return one design per episode."""
-        if history.x is None:
+        """Return one design per episode."""
+        if history.designs is None:
             summary = self.empty.expand(len(history), -1)
         else:
-            summary = self.pair(torch.cat((history.x, history.y), -1)).sum(1)
+            summary = self.pair(torch.cat((history.designs, history.outcomes), -1)).sum(1)
         unit_x = torch.sigmoid(self.head(summary))
         return self.low + (self.high - self.low) * unit_x
 
 
 class DAD(L.LightningModule):
-    """Train a DAD policy by maximizing sequential prior contrastive estimation."""
-
+    """Train a DAD policy via sequential prior contrastive estimation."""
     def __init__(self, env: pb.BED, cfg: Config):
-        """Take a PyBED environment and settings and create the Lightning model."""
+        """Create the Lightning model."""
         super().__init__()
         self.env, self.cfg = env, cfg
         self.policy = DesignPolicy(float(env.cfg["low"]), float(env.cfg["high"]))
         self.save_hyperparameters(asdict(cfg))
 
     def rollout_log_likelihoods(self, theta: torch.Tensor) -> torch.Tensor:
-        """Take true-plus-contrastive parameters and return their full-history log likelihoods."""
+        """Return full-history log likelihoods for parameters."""
         batch_size, choices = theta.shape[:2]
         truth = theta[:, 0]
         history = pb.Batch(mask=torch.empty((batch_size, 0), dtype=torch.bool, device=theta.device))
@@ -92,11 +78,11 @@ class DAD(L.LightningModule):
             )
             xs.append(x)
             ys.append(y)
-            history = pb.Batch(x=torch.stack(xs, 1), y=torch.stack(ys, 1))
+            history = pb.Batch(designs=torch.stack(xs, 1), outcomes=torch.stack(ys, 1))
         return log_likelihoods
 
     def training_step(self, batch: tuple[torch.Tensor], batch_index: int) -> torch.Tensor:
-        """Take one parameter batch and index, log the DAD bound, and return its loss."""
+        """Log the DAD bound and return its loss."""
         del batch_index
         log_likelihoods = self.rollout_log_likelihoods(batch[0])
         bound = pb.metrics.spce(log_likelihoods)
@@ -104,12 +90,12 @@ class DAD(L.LightningModule):
         return -bound
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        """Take the model parameters and return their Adam optimizer."""
+        """Return Adam optimizer."""
         return torch.optim.Adam(self.parameters(), lr=self.cfg.learning_rate)
 
 
 def training_data(env: pb.BED, cfg: Config) -> TensorDataset:
-    """Take an environment and settings and return fixed true-plus-contrastive prior draws."""
+    """Return fixed true-plus-contrastive prior draws."""
     draws = env.sample_prior(
         cfg.train_episodes * (cfg.contrastives + 1),
         generator=pb.data.Seeds(cfg.seed).torch("dad-training"),
@@ -119,7 +105,7 @@ def training_data(env: pb.BED, cfg: Config) -> TensorDataset:
 
 
 def evaluate(model: DAD, env: pb.BED, cfg: Config, output: Path, logger: WandbLogger) -> None:
-    """Take a trained policy, evaluate it, and save its trajectory locally and in W&B."""
+    """Evaluate policy and save trajectory locally and in W&B."""
     model.eval()
 
     def policy(history: pb.Batch, **_: object) -> torch.Tensor:
@@ -133,66 +119,64 @@ def evaluate(model: DAD, env: pb.BED, cfg: Config, output: Path, logger: WandbLo
     dataset.save(output / "evaluation.pt")
     logger.experiment.log(
         {
-            "evaluation/mean_outcome": float(dataset.batch.y.mean()),
+            "evaluation/mean_outcome": float(dataset.batch.outcomes.mean()),
             "evaluation/trajectory": wandb.Image(figure),
         }
     )
     plt.close(figure)
 
 
-def main() -> None:
-    """Build the data and services, train DAD, evaluate it, and return nothing."""
-    cfg = Config()
-    L.seed_everything(cfg.seed, workers=True)
-    env = pb.make(
-        "location-v0",
-        sources=1,
-        dims=2,
-        budget=cfg.budget,
-        low=-4.0,
-        high=4.0,
-        noise=0.5,
-    )
-    output = Path(cfg.runs) / "dad-lightning-wandb"
-    output.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("WANDB_CACHE_DIR", str(output / "wandb-cache"))
-    data = training_data(env, cfg)
-    train_loader = DataLoader(
-        data,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        generator=pb.data.Seeds(cfg.seed).torch("dad-loader"),
-        num_workers=0,
-    )
-    logger = WandbLogger(
-        project=cfg.wandb_project,
-        name="dad-location",
-        save_dir=output,
-        offline=cfg.wandb_mode == "offline",
-        mode=cfg.wandb_mode,
-        log_model=False,
-    )
-    model = DAD(env, cfg)
-    use_gpu = torch.cuda.is_available()
-    devices = cfg.devices if use_gpu else 1
-    trainer = L.Trainer(
-        max_epochs=cfg.epochs,
-        accelerator="gpu" if use_gpu else "cpu",
-        devices=devices,
-        strategy="ddp" if devices > 1 else "auto",
-        logger=logger,
-        default_root_dir=output,
-        enable_checkpointing=True,
-        deterministic=True,
-        log_every_n_steps=1 if QUICK else 10,
-        enable_progress_bar=not QUICK,
-    )
-    trainer.fit(model, train_loader)
-    trainer.save_checkpoint(output / "last.ckpt")
-    if trainer.is_global_zero:
-        evaluate(model, env, cfg, output, logger)
-        logger.experiment.finish()
+# %% Read configuration and prepare run
+config_path = Path(CONFIG_PATH) if CONFIG_PATH else Path(__file__).with_name("config.yaml")
+if not config_path.exists():
+    config_path = Path(__file__).with_name("config.yaml")
+cfg = Config(**pb.expt.load_config(config_path))
+if DEBUG:
+    cfg = replace(cfg, budget=3, train_episodes=64, eval_episodes=16, contrastives=3, batch_size=16, epochs=1, wandb_mode="disabled")
+L.seed_everything(cfg.seed, workers=True)
+env = pb.make("location-v0", sources=1, dims=2, budget=cfg.budget, low=-4.0, high=4.0, noise=0.5)
+run = pb.expt.Run.create(cfg.runs, "dad-lightning-wandb", cfg, seed_value=cfg.seed, source_files=[__file__, config_path])
+output = run.path
 
 
-if __name__ == "__main__":
-    main()
+# %% Build data and logger
+data = training_data(env, cfg)
+train_loader = DataLoader(
+    data,
+    batch_size=cfg.batch_size,
+    shuffle=True,
+    generator=pb.data.Seeds(cfg.seed).torch("dad-loader"),
+    num_workers=0,
+)
+logger = WandbLogger(
+    project=cfg.wandb_project,
+    name="dad-location",
+    save_dir=output,
+    offline=cfg.wandb_mode == "offline",
+    mode=cfg.wandb_mode,
+    log_model=False,
+)
+
+
+# %% Train and evaluate
+model = DAD(env, cfg)
+use_gpu = torch.cuda.is_available()
+devices = cfg.devices if use_gpu else 1
+trainer = L.Trainer(
+    max_epochs=cfg.epochs,
+    accelerator="gpu" if use_gpu else "cpu",
+    devices=devices,
+    strategy="ddp" if devices > 1 else "auto",
+    logger=logger,
+    default_root_dir=output,
+    enable_checkpointing=True,
+    deterministic=True,
+    log_every_n_steps=1 if DEBUG else 10,
+    enable_progress_bar=not DEBUG,
+)
+trainer.fit(model, train_loader, ckpt_path=cfg.checkpoint)
+trainer.save_checkpoint(output / "last.ckpt")
+if trainer.is_global_zero:
+    evaluate(model, env, cfg, output, logger)
+    run.finish(checkpoint="last.ckpt")
+    logger.experiment.finish()

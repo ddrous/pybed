@@ -1,4 +1,4 @@
-"""Small experiment runner, diagnostics, checkpoints, and policy comparison."""
+"""Small experiment records, checkpoints, training, and policy comparison."""
 
 from __future__ import annotations
 
@@ -7,18 +7,76 @@ import hashlib
 import json
 import platform
 import random
+import shutil
 import subprocess
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import yaml
 
 from .core import BED, Batch
 from .data import EpisodeDataset, Stream
+
+
+def _plain(value: Any) -> Any:
+    """Take a configuration value and return plain data that YAML can save."""
+    if is_dataclass(value):
+        value = asdict(value)
+    if isinstance(value, Mapping):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    """Take a YAML path and return its configuration dictionary."""
+    loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, Mapping):
+        raise TypeError("A configuration file must contain a YAML mapping")
+    return dict(loaded)
+
+
+def save_config(config: Mapping[str, Any] | Any, path: str | Path) -> Path:
+    """Take a configuration and path, save readable YAML, and return the path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(_plain(config), sort_keys=False), encoding="utf-8")
+    return path
+
+
+def snapshot(files: Sequence[str | Path], folder: str | Path) -> Path:
+    """Take source files and a run folder and return a small code snapshot folder."""
+    destination = Path(folder) / "code"
+    destination.mkdir(parents=True, exist_ok=True)
+    for source in map(Path, files):
+        if source.is_file():
+            shutil.copy2(source, destination / source.name)
+    project = Path(__file__).resolve().parents[1]
+    try:
+        changes = subprocess.run(
+            ["git", "-C", str(project), "diff", "--binary"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout
+        if changes:
+            (destination / "working-tree.patch").write_text(changes, encoding="utf-8")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return destination
 
 
 def seed(seed: int, *, deterministic: bool = True) -> None:
@@ -51,17 +109,21 @@ class Run:
         *,
         run_id: str | None = None,
         seed_value: int = 0,
+        source_files: Sequence[str | Path] = (),
     ) -> Run:
-        """Take a root, name, and configuration and return a new local experiment run."""
+        """Take run settings and source files and return a new local experiment record."""
         root = Path(root)
         timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
-        normalized = asdict(cfg) if is_dataclass(cfg) else dict(cfg)
+        normalized = _plain(cfg)
+        if not isinstance(normalized, Mapping):
+            raise TypeError("Run configuration must be a mapping or dataclass")
+        normalized = dict(normalized)
         digest = hashlib.sha256(json.dumps(normalized, sort_keys=True, default=str).encode()).hexdigest()[:8]
         run_id = run_id or f"{timestamp}-{digest}"
         path = root / name / run_id
         if path.exists():
             raise FileExistsError(f"Run already exists: {path}")
-        for folder in (path, path / "checkpoints", path / "figures", path / "data"):
+        for folder in (path, path / "checkpoints", path / "figures", path / "data", path / "code"):
             folder.mkdir(parents=True, exist_ok=True)
         seed(seed_value)
         git_commit = None
@@ -81,8 +143,9 @@ class Run:
             "cuda": torch.version.cuda,
             "git_commit": git_commit,
         }
-        (path / "config.json").write_text(json.dumps(normalized, indent=2, sort_keys=True, default=str) + "\n")
+        save_config(normalized, path / "config.yaml")
         (path / "meta.json").write_text(json.dumps(metadata, indent=2, sort_keys=True, default=str) + "\n")
+        snapshot(source_files, path)
         return cls(path=path, cfg=normalized, started=time.time())
 
     def log(self, step: int, **metrics: float) -> dict[str, float]:
@@ -222,10 +285,10 @@ def compare(
     stream = Stream(env, episodes, seed=seed_value, budget=budget)
     results: dict[str, dict[str, float]] = {}
     datasets: dict[str, EpisodeDataset] = {}
-    reference_theta = stream.theta(epoch)
+    reference_parameters = stream.parameters(epoch)
     for name, policy in policies.items():
         dataset = stream.generate(policy, epoch=epoch, common_noise=True)
-        if not torch.equal(reference_theta, dataset.batch.theta):
+        if not torch.equal(reference_parameters, dataset.batch.parameters):
             raise RuntimeError(f"Common-random-number invariant failed for policy {name}")
         value = score(env, dataset.batch)
         results[name] = (
