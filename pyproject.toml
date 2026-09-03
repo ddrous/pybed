@@ -24,6 +24,7 @@ dependencies = [
   "torch>=2.1",
   "matplotlib>=3.7",
   "seaborn>=0.12",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
@@ -42,7 +43,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 
 [tool.ruff]
-line-length = 120
+line-length = 180
 target-version = "py310"
 
 [tool.ruff.lint]

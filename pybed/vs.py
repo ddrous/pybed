@@ -17,7 +17,7 @@ from matplotlib.figure import Figure
 from .core import Batch
 
 
-def style(context: str = "paper", font_scale: float = 1.25) -> None:
+def style(context: str = "paper", font_scale: float = 1.55) -> None:
     """Apply PyBED's white-grid publication style without running at import time."""
     sns.set_theme(
         context=context,
@@ -30,6 +30,9 @@ def style(context: str = "paper", font_scale: float = 1.25) -> None:
             "axes.titleweight": "bold",
             "axes.labelpad": 7,
             "axes.titlepad": 10,
+            "grid.color": "#8d99a6",
+            "grid.alpha": 0.24,
+            "grid.linewidth": 0.8,
             "xtick.major.size": 6,
             "ytick.major.size": 6,
             "legend.frameon": True,
@@ -98,21 +101,17 @@ def location(
         if posterior is not None:
             cloud = np.asarray(torch.as_tensor(posterior).detach().cpu()).reshape(-1, 2)
             ax.scatter(cloud[:, 0], cloud[:, 1], s=15, alpha=0.18, color="#8f6bb3", label="posterior")
-        path = ax.scatter(design[:, 0], design[:, 1], c=steps, cmap="viridis", s=60, zorder=3, label="design")
-        ax.plot(design[:, 0], design[:, 1], color="#4f5d75", alpha=0.35, lw=1.5)
-        ax.scatter(
-            theta[:, 0],
-            theta[:, 1],
-            marker="*",
-            s=260,
-            color="#d1495b",
-            edgecolor="white",
-            lw=1,
-            label="truth",
-            zorder=5,
-        )
+
+        path = ax.scatter(design[:, 0], design[:, 1], c=steps, cmap="viridis", s=68, edgecolor="white", linewidth=0.65, zorder=3, label="design")
+
+        ax.scatter(theta[:, 0], theta[:, 1], marker="*", s=260, color="#d1495b", edgecolor="white", lw=1, label="truth", zorder=5)
+
         fig.colorbar(path, ax=ax, label="design step")
-        ax.set(xlabel=r"design $\xi_1$", ylabel=r"design $\xi_2$", title="Location-finding trajectory")
+        ax.set(
+            xlabel=r"design $\mathbf{x}_1$",
+            ylabel=r"design $\mathbf{x}_2$",
+            title="Location-finding trajectory",
+        )
         ax.set_xlim(env.cfg["low"], env.cfg["high"])
         ax.set_ylim(env.cfg["low"], env.cfg["high"])
         ax.set_aspect("equal", adjustable="box")

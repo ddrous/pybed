@@ -1,261 +1,239 @@
-# %% Imports, configuration, and experiment conventions
-"""ActionBED: a compact joint design-and-inference example built entirely on PyBED.
+# %% ACTION-BED for source location finding (Rossa, Phillips & Rainforth, 2026)
+"""Paper-faithful, single-file ACTION-BED example.
 
-This is intentionally a single notebook-style file with no ``main()``.  It trains
-both a reparameterized continuous design policy (the action model) and a Gaussian
-posterior estimator, evaluates against a common-random-number random policy, and
-writes transparent run artifacts without Weights & Biases.
-
-Set ``PYBED_QUICK=1`` for the smoke-test configuration used in CI.
+This learns a deterministic design policy and a terminal point-estimation policy
+directly from expected future loss--there is deliberately no posterior model.
+The paper settings are the defaults; set ``PYBED_QUICK=1`` for a smoke test.
 """
 
 import os
-from dataclasses import asdict, dataclass
+import sys
+from dataclasses import asdict, dataclass, replace
 
 import matplotlib.pyplot as plt
 import torch
 from torch import nn
 
+from tqdm.auto import tqdm
 import pybed as pb
 
 
 @dataclass(frozen=True)
 class Config:
-    seed: int = 2030
-    sources: int = 1
-    dims: int = 2
-    budget: int = 8
-    epochs: int = 60
-    steps_per_epoch: int = 16
-    batch_size: int = 128
-    hidden: int = 128
-    learning_rate: float = 3e-4
-    min_std: float = 0.03
-    entropy_weight: float = 1e-3
-    eval_episodes: int = 256
+    seed: int = 42
+    sources: int = 2
+    budget: int = 30
+    batch_size: int = 256
+    warmup_steps: int = 50_00
+    joint_steps: int = 150_00
+    learning_rate: float = 5e-4
+    decay: float = 0.95
+    decay_period: int = 2_000
+    objective: str = "log_mse"  # "mse" or "log_mse"
+    eval_episodes: int = 2_048
+    log_every: int = 100
     runs: str = "runs"
 
 
 cfg = Config()
 if os.getenv("PYBED_QUICK") == "1":
-    cfg = Config(epochs=2, steps_per_epoch=2, batch_size=16, budget=3, eval_episodes=16, hidden=32)
+    cfg = replace(cfg, budget=4, batch_size=16, warmup_steps=2, joint_steps=3, eval_episodes=16, log_every=1)
 
-pb.exp.seed(cfg.seed)
+pb.exp.seed(cfg.seed, deterministic=False)
+# Clear strict determinism if an earlier notebook cell enabled it; attention uses
+# PyTorch's default backend selection for the installed hardware and build.
+torch.use_deterministic_algorithms(False)
 pb.vs.style()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# %% Environment intuition comes first
+prior = pb.Normal(torch.zeros(cfg.sources, 2), torch.ones(cfg.sources, 2))
 env = pb.make(
     "location-v0",
     sources=cfg.sources,
-    dims=cfg.dims,
+    dims=2,
     budget=cfg.budget,
-    low=0.0,
-    high=1.0,
-    noise=0.35,
+    prior=prior,
+    low=-4.0,
+    high=4.0,
+    background=0.1,
+    softening=1e-4,
+    strength=1.0,
+    noise=0.5,
+    log_signal=True,
 )
-print(env)
-
-preview = pb.data.EpochStream(env, episodes=16, seed=cfg.seed, budget=cfg.budget).generate(None)
-preview_fig, _ = env.visualize("episode", preview.batch, index=0)
+seeds = pb.data.SeedBank(cfg.seed)
+run = pb.exp.Run.create(cfg.runs, "actionbed", asdict(cfg), seed_value=cfg.seed)
 
 
-# %% One history encoder, one posterior head, and one stochastic action head
-class HistoryEncoder(nn.Module):
-    """Masked DeepSets encoder; padding never leaks into a history representation."""
-
-    def __init__(self, design_dim: int, obs_dim: int, hidden: int):
+# %% TNP-like deterministic design policy from Appendix E.1
+class DesignPolicy(nn.Module):
+    def __init__(self, budget: int):
         super().__init__()
-        self.hidden = hidden
-        self.empty = nn.Parameter(torch.zeros(hidden))
-        self.tokens = nn.Sequential(
-            nn.Linear(design_dim + obs_dim + 1, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-        )
-        self.mix = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.SiLU(), nn.LayerNorm(hidden))
+        self.design_encoder = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, 32))
+        self.outcome_encoder = nn.Sequential(nn.Linear(1, 64), nn.ReLU(), nn.Linear(64, 32))
+        self.pair = nn.Sequential(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 32))
+        self.adapter = nn.Linear(32, 64)
+        self.history_type = nn.Parameter(torch.empty(64).normal_(std=0.02))
+        self.decision_type = nn.Parameter(torch.empty(64).normal_(std=0.02))
+        self.decision = nn.Parameter(torch.empty(64).normal_(std=0.02))
+        self.time = nn.Embedding(budget + 1, 64)
+        layer = nn.TransformerEncoderLayer(64, 4, 128, batch_first=True)
+        self.transformer = nn.TransformerEncoder(layer, 2)
+        self.norm = nn.LayerNorm(64)
+        self.emitter = nn.Sequential(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 2))
 
     def forward(self, history: pb.Batch) -> torch.Tensor:
         batch = len(history)
-        if history.design is None or history.obs is None or history.design.shape[1] == 0:
-            return self.empty.expand(batch, -1)
-        steps = history.design.shape[1]
-        time = torch.linspace(1 / max(1, steps), 1, steps, device=history.design.device)
-        time = time.reshape(1, steps, 1).expand(batch, -1, -1)
-        tokens = self.tokens(torch.cat((history.design, history.obs, time), -1))
-        mask = torch.ones((batch, steps), device=tokens.device) if history.mask is None else history.mask.to(tokens)
-        pooled = (tokens * mask[..., None]).sum(1) / mask.sum(1, keepdim=True).clamp_min(1)
-        maximum = tokens.masked_fill(~mask.bool()[..., None], -torch.inf).max(1).values
-        maximum = torch.where(torch.isfinite(maximum), maximum, self.empty)
-        return self.mix(torch.cat((pooled, maximum), -1))
+        steps = 0 if history.design is None else history.design.shape[1]
+        if steps:
+            design = self.design_encoder(history.design)
+            outcome = self.outcome_encoder(history.obs)
+            tokens = self.adapter(self.pair(torch.cat((design, outcome), -1)))
+            times = self.time(torch.arange(steps, device=tokens.device))[None]
+            tokens = tokens + self.history_type + times
+        else:
+            tokens = self.decision.new_empty(batch, 0, 64)
+        query = self.decision + self.decision_type + self.time.weight[steps]
+        tokens = torch.cat((tokens, query.expand(batch, 1, -1)), 1)
+        return self.emitter(self.transformer(self.norm(tokens))[:, -1])
+
+
+# %% Separate terminal downstream action policy from Appendix G.1
+class ActionPolicy(nn.Module):
+    def __init__(self, budget: int, sources: int):
+        super().__init__()
+        self.sources = sources
+        self.net = nn.Sequential(
+            nn.Linear(3 * budget, 512),
+            nn.GELU(),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Linear(128, 2 * sources),
+        )
+
+    def forward(self, history: pb.Batch) -> torch.Tensor:
+        pairs = torch.cat((history.design, history.obs), -1).flatten(1)
+        return self.net(pairs).reshape(len(history), self.sources, 2)
 
 
 class ActionBED(nn.Module):
-    """Jointly trained posterior and bounded stochastic BED policy."""
-
-    def __init__(self, env: pb.BED, hidden: int, min_std: float):
+    def __init__(self):
         super().__init__()
-        theta_dim = int(torch.tensor(env.specs["theta"].shape).prod())
-        design_dim = int(torch.tensor(env.specs["design"].shape).prod())
-        obs_dim = int(torch.tensor(env.specs["obs"].shape).prod())
-        self.encoder = HistoryEncoder(design_dim, obs_dim, hidden)
-        self.posterior_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 2 * theta_dim))
-        self.action_head = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 2 * design_dim))
-        self.theta_shape = env.specs["theta"].shape
-        self.design_shape = env.specs["design"].shape
-        self.low, self.high, self.min_std = env.specs["design"].low, env.specs["design"].high, min_std
+        self.design_policy = DesignPolicy(cfg.budget)
+        self.action_policy = ActionPolicy(cfg.budget, cfg.sources)
 
-    def infer(self, history: pb.Batch, **context: object) -> torch.distributions.Independent:
-        mean, raw_std = self.posterior_head(self.encoder(history)).chunk(2, -1)
-        std = torch.nn.functional.softplus(raw_std) + self.min_std
-        return torch.distributions.Independent(torch.distributions.Normal(mean, std), 1)
 
-    def design(
-        self,
-        history: pb.Batch,
-        *,
-        generator: torch.Generator | None = None,
-        deterministic: bool | None = None,
-        **context: object,
-    ) -> torch.Tensor:
-        mean, raw_std = self.action_head(self.encoder(history)).chunk(2, -1)
-        std = torch.nn.functional.softplus(raw_std) + self.min_std
-        deterministic = not self.training if deterministic is None else deterministic
-        latent = (
-            mean if deterministic else mean + std * torch.randn(mean.shape, generator=generator, device=mean.device)
+model = ActionBED().to(device)
+
+
+def sample_truth(stage: str, step: int) -> torch.Tensor:
+    generator = seeds.torch(stage, step, device=device)
+    return torch.randn((cfg.batch_size, cfg.sources, 2), generator=generator, device=device)
+
+
+def rollout(theta: torch.Tensor, step: int, *, random: bool) -> pb.Batch:
+    history = pb.Batch(theta=theta, design=None, obs=None, mask=None)
+    designs, outcomes = [], []
+    for time in range(cfg.budget):
+        if random:
+            design = torch.randn((len(theta), 2), generator=seeds.torch("warm-design", step, time, device=device), device=device)
+        else:
+            design = model.design_policy(history)
+        obs = env.simulate(
+            theta,
+            design,
+            generator=seeds.torch("noise", random, step, time, device=device),
         )
-        bounded = self.low + (self.high - self.low) * torch.sigmoid(latent)
-        return bounded.reshape(len(history), *self.design_shape)
-
-    def entropy(self, history: pb.Batch) -> torch.Tensor:
-        mean, raw_std = self.action_head(self.encoder(history)).chunk(2, -1)
-        std = torch.nn.functional.softplus(raw_std) + self.min_std
-        return torch.distributions.Normal(mean, std).entropy().sum(-1).mean()
+        designs.append(design)
+        outcomes.append(obs)
+        history = pb.Batch(theta=theta, design=torch.stack(designs, 1), obs=torch.stack(outcomes, 1), mask=None)
+    return history
 
 
-model = ActionBED(env, cfg.hidden, cfg.min_std).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-5)
-run = pb.exp.Run.create(cfg.runs, "actionbed", asdict(cfg), seed_value=cfg.seed)
-run.save_figure(preview_fig, "environment-random-preview")
+def canonical(theta: torch.Tensor) -> torch.Tensor:
+    order = theta.square().sum(-1).argsort(-1)
+    return theta.gather(1, order[..., None].expand_as(theta))
 
 
-# %% Joint training: prefix posterior error differentiates through every action and outcome
+def future_loss(estimate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+    if cfg.objective == "mse":
+        direct = (estimate - truth).square().sum((-1, -2))
+        swapped = (estimate - truth.flip(1)).square().sum((-1, -2))
+        return torch.minimum(direct, swapped).mean()
+    if cfg.objective == "log_mse":
+        error = (estimate - canonical(truth)).square().sum((-1, -2))
+        return (error + torch.log(error + 1e-6)).mean()
+    raise ValueError("objective must be 'mse' or 'log_mse'")
+
+
+def update(optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.ExponentialLR, step: int, *, random: bool) -> float:
+    optimizer.zero_grad(set_to_none=True)
+    theta = sample_truth("warm-theta" if random else "joint-theta", step)
+    history = rollout(theta, step, random=random)
+    loss = future_loss(model.action_policy(history), theta)
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"Non-finite {cfg.objective} loss at step {step}")
+    loss.backward()
+    optimizer.step()
+    if (step + 1) % cfg.decay_period == 0:
+        scheduler.step()
+    return float(loss.detach())
+
+
+# %% Algorithm 2: downstream warm-up, then joint pathwise optimization
 records: list[dict[str, float]] = []
-truth_stream = pb.data.EpochStream(env, cfg.steps_per_epoch * cfg.batch_size, seed=cfg.seed)
-seeds = pb.data.SeedBank(cfg.seed)
+model.train()
+warm_optimizer = torch.optim.Adam(model.action_policy.parameters(), lr=cfg.learning_rate, betas=(0.8, 0.998))
+warm_scheduler = torch.optim.lr_scheduler.ExponentialLR(warm_optimizer, gamma=cfg.decay)
+warm_progress = tqdm(range(cfg.warmup_steps), desc="Action-BED warm-up", unit="step", dynamic_ncols=True)
+for step in warm_progress:
+    loss = update(warm_optimizer, warm_scheduler, step, random=True)
+    warm_progress.set_postfix(loss=f"{loss:.4g}", lr=f"{warm_optimizer.param_groups[0]['lr']:.2e}", refresh=False)
+    if step % cfg.log_every == 0 or step + 1 == cfg.warmup_steps:
+        records.append(run.log(step + 1, phase=0, loss=loss))
 
-for epoch in range(cfg.epochs):
-    epoch_truth = truth_stream.theta(epoch).reshape(cfg.steps_per_epoch, cfg.batch_size, *env.specs["theta"].shape)
-    epoch_loss = 0.0
-    epoch_mse = 0.0
-    model.train()
+run.checkpoint("warmup", model=model, optimizer=warm_optimizer, step=cfg.warmup_steps)
+optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate, betas=(0.8, 0.998))
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=cfg.decay)
+joint_progress = tqdm(range(cfg.joint_steps), desc="Action-BED joint", unit="step", dynamic_ncols=True)
+for step in joint_progress:
+    loss = update(optimizer, scheduler, step, random=False)
+    joint_progress.set_postfix(loss=f"{loss:.4g}", lr=f"{optimizer.param_groups[0]['lr']:.2e}", refresh=False)
+    if step % cfg.log_every == 0 or step + 1 == cfg.joint_steps:
+        records.append(run.log(cfg.warmup_steps + step + 1, phase=1, loss=loss))
 
-    for step, theta_cpu in enumerate(epoch_truth):
-        theta = theta_cpu.to(device)
-        history = pb.Batch(theta=theta, design=None, obs=None, mask=None)
-        posterior_losses = []
-        posterior_mses = []
-
-        for time in range(cfg.budget):
-            action_generator = seeds.torch("action", epoch, step, time, device=device)
-            noise_generator = seeds.torch("observation", epoch, step, time, device=device)
-            design = model.design(history, generator=action_generator)
-            obs = env.simulate(theta, design, generator=noise_generator, epoch=epoch, step=time)
-            designs = design[:, None] if history.design is None else torch.cat((history.design, design[:, None]), 1)
-            outcomes = obs[:, None] if history.obs is None else torch.cat((history.obs, obs[:, None]), 1)
-            mask = torch.ones((cfg.batch_size, time + 1), dtype=torch.bool, device=device)
-            history = pb.Batch(theta=theta, design=designs, obs=outcomes, mask=mask)
-            posterior = model.infer(history)
-            truth = theta.flatten(1)
-            posterior_losses.append(-posterior.log_prob(truth).mean())
-            posterior_mses.append((posterior.mean - truth).square().mean())
-
-        loss = torch.stack(posterior_losses).mean() - cfg.entropy_weight * model.entropy(history)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        optimizer.step()
-        epoch_loss += float(loss.detach())
-        epoch_mse += float(torch.stack(posterior_mses).mean().detach())
-
-    diagnostics = run.log(
-        (epoch + 1) * cfg.steps_per_epoch,
-        epoch=epoch,
-        loss=epoch_loss / cfg.steps_per_epoch,
-        posterior_mse=epoch_mse / cfg.steps_per_epoch,
-    )
-    records.append(diagnostics)
-
-run.checkpoint("last", model=model, optimizer=optimizer, step=cfg.epochs * cfg.steps_per_epoch)
+run.checkpoint("last", model=model, optimizer=optimizer, step=cfg.warmup_steps + cfg.joint_steps)
 
 
-# %% The same model now supplies PyBED's design, infer, and predict-facing API
-def posterior_predict(query: torch.Tensor, history: pb.Batch, *, env: pb.BED) -> torch.Tensor:
-    posterior = model.infer(history.to(device))
-    theta = posterior.mean.reshape(len(history), *env.specs["theta"].shape)
-    return pb.sim.location(
-        theta,
-        query.to(device),
-        strength=env.cfg["strength"],
-        background=env.cfg["background"],
-        softening=env.cfg["softening"],
-        noise=0.0,
-        log_signal=env.cfg["log_signal"],
-    )
-
-
-action_env = env.with_components(design=model.design, infer=model.infer, predict=posterior_predict)
-print(action_env)
-
-
-# %% Common-truth evaluation against random designs
-def score(candidate_env: pb.BED, batch: pb.Batch) -> dict[str, float]:
-    history = batch.to(device)
-    with torch.no_grad():
-        posterior = model.infer(history)
-        truth = history.theta.flatten(1)
-        return {
-            "mse": float(pb.metrics.mse(posterior.mean, truth)),
-            "log_mse": float(pb.metrics.log_mse(posterior.mean, truth)),
-            "nll": float(-posterior.log_prob(truth).mean()),
-        }
-
-
+# %% Terminal downstream evaluation and trajectory visualization
 model.eval()
 
 
-def learned_policy(history: pb.Batch, **context: object) -> torch.Tensor:
+def learned_policy(history: pb.Batch, **_: object) -> torch.Tensor:
     with torch.no_grad():
-        return model.design(history.to(device), deterministic=True).cpu()
+        return model.design_policy(history.to(device)).cpu()
 
 
-results, trajectories = pb.exp.compare(
-    env,
-    {"ActionBED": learned_policy, "random": None},
-    score,
-    episodes=cfg.eval_episodes,
-    seed_value=cfg.seed + 10_000,
-    budget=cfg.budget,
-)
+evaluation = pb.data.EpochStream(env, cfg.eval_episodes, seed=cfg.seed + 1, budget=cfg.budget).generate(learned_policy)
+with torch.no_grad():
+    batch = evaluation.batch.to(device)
+    estimate = model.action_policy(batch)
+    direct = (estimate - batch.theta).square().mean((-1, -2))
+    swapped = (estimate - batch.theta.flip(1)).square().mean((-1, -2))
+    set_mse = torch.minimum(direct, swapped)
+    ordered_error = (estimate - canonical(batch.theta)).square().sum((-1, -2))
+    results = {
+        "set_mse": float(set_mse.mean()),
+        "log_mse": float(torch.log(ordered_error + 1e-6).mean()),
+        "set_mse_se": float(set_mse.std() / len(set_mse) ** 0.5),
+    }
+
 print(results)
-
-
-# %% Camera-ready diagnostics and trajectories
-loss_fig, _ = pb.vs.training(records, keys=("loss", "posterior_mse"), logy=True)
-run.save_figure(loss_fig, "training")
-
-comparison_fig, _ = pb.vs.benchmark(results, metric="mse")
-run.save_figure(comparison_fig, "policy-comparison")
-
-learned_fig, _ = env.visualize("episode", trajectories["ActionBED"].batch, index=0)
-random_fig, _ = env.visualize("episode", trajectories["random"].batch, index=0)
-run.save_figure(learned_fig, "learned-trajectory")
-run.save_figure(random_fig, "random-trajectory")
-
-run.save_data(trajectories["ActionBED"], "evaluation-actionbed")
-run.save_data(trajectories["random"], "evaluation-random")
+training_fig, _ = pb.vs.training(records, keys=("loss",), logy=False)
+trajectory_fig, _ = env.visualize("episode", evaluation.batch, index=0)
+run.save_figure(training_fig, "training")
+run.save_figure(trajectory_fig, "trajectory")
+run.save_data(evaluation, "evaluation")
 run.finish(results=results)
-
 plt.show()

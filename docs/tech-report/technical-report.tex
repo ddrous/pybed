@@ -1,7 +1,7 @@
 \documentclass[11pt]{article}
 
 \usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,booktabs,array}
+\usepackage{amsmath,amssymb,bm,booktabs,array}
 \usepackage{microtype}
 \microtypesetup{expansion=false}
 \usepackage{xcolor}
@@ -66,10 +66,10 @@ models, and explains the included single-file ActionBED example and validation s
 
 \section{Motivation}
 
-A sequential BED problem has an unknown parameter $\theta$, a design $\xi_t$, an
+A sequential BED problem has an unknown parameter $\theta$, a design $\bm{x}_t$, an
 outcome $y_t$, and history
 \begin{equation}
-  h_t = \{(\xi_i,y_i)\}_{i=1}^{t}.
+  h_t = \{(\bm{x}_i,y_i)\}_{i=1}^{t}.
 \end{equation}
 A policy $\pi$ maps the history to a distribution over the next design, while an
 inference method represents $p(\theta\mid h_t)$ or a target derived from it. This
@@ -154,7 +154,7 @@ mask, an arbitrary target, context, and metadata. Fixed and variable-length hist
 therefore share one representation:
 \begin{align}
  \theta &\in \mathbb{R}^{B\times d_\theta}, \\
- \xi &\in \mathbb{R}^{B\times T\times d_\xi}, \\
+ \bm{x} &\in \mathbb{R}^{B\times T\times d_x}, \\
  y &\in \mathbb{R}^{B\times T\times d_y}, \\
  m &\in \{0,1\}^{B\times T}.
 \end{align}
@@ -247,20 +247,20 @@ requires the schedule itself to be deterministic from recorded context and seeds
 \subsection{Location finding}
 
 For $K$ sources at positions $\theta_k\in\mathbb{R}^d$ and sensor design
-$\xi\in\mathbb{R}^d$, the noise-free intensity is
+$\bm{x}\in\mathbb{R}^d$, the noise-free intensity is
 \begin{equation}
- \mu(\theta,\xi) = b + \sum_{k=1}^{K}
- \frac{\alpha_k}{m + \lVert\theta_k-\xi\rVert_2^2}.
+ \mu(\theta,\bm{x}) = b + \sum_{k=1}^{K}
+ \frac{\alpha_k}{m + \lVert\theta_k-\bm{x}\rVert_2^2}.
 \end{equation}
 The default observation follows the modern ALINE/JADAI form
 \begin{equation}
- y = \log \mu(\theta,\xi) + \sigma\epsilon,
+ y = \log \mu(\theta,\bm{x}) + \sigma\epsilon,
  \qquad \epsilon\sim\mathcal{N}(0,1),
 \end{equation}
 with $b=0.1$, $m=10^{-4}$, $\alpha_k=1$, and $\sigma=0.5$
 \cite{huang2025aline,bracher2025jadai}. All constants, dimensionalities, source
 counts, bounds, and log transformation are configurable. Because noise is
-reparameterized, gradients flow from a posterior loss through $y$ and $\xi$ into a
+reparameterized, gradients flow from a posterior loss through $y$ and $\bm{x}$ into a
 continuous policy.
 
 Multiple sources are exchangeable. The metric module therefore provides exact
@@ -269,16 +269,16 @@ permutation-invariant set MSE for the small $K$ used in these benchmarks.
 \subsection{MNIST image discovery}
 
 The unknown is an image $\theta\in[0,1]^{C\times H\times W}$ and the design is a
-continuous mask center $\xi\in[0,1]^2$. The smooth bivariate-logistic mask is a
-product of two soft rectangular windows. For pixel coordinate $x=(x_1,x_2)$,
+continuous mask center $\bm{x}\in[0,1]^2$. The smooth bivariate-logistic mask is a
+product of two soft rectangular windows. For pixel coordinate $u=(u_1,u_2)$,
 \begin{align}
- M_{\xi,s,h}(x) = &\,[S(x_1-\xi_1+h;s)+S(\xi_1+h-x_1;s)-1] \\
- &\times[S(x_2-\xi_2+h;s)+S(\xi_2+h-x_2;s)-1],
+ M_{\bm{x},s,h}(u) = &\,[S(u_1-x_1+h;s)+S(x_1+h-u_1;s)-1] \\
+ &\times[S(u_2-x_2+h;s)+S(x_2+h-u_2;s)-1],
 \end{align}
 where $S(a;s)=(1+\exp(-a/s))^{-1}$. The observation is
 \begin{equation}
- y(x)=\operatorname{clip}_{[0,1]}\{\theta(x)M_{\xi,s,h}(x)+\eta(x)\},
- \quad \eta(x)\sim\mathcal{U}(0,\sigma).
+ y(u)=\operatorname{clip}_{[0,1]}\{\theta(u)M_{\bm{x},s,h}(u)+\eta(u)\},
+ \quad \eta(u)\sim\mathcal{U}(0,\sigma).
 \end{equation}
 This follows the image-discovery setup documented by JADAI
 \cite{bracher2025jadai}. Arrays are supplied directly or loaded lazily through the
@@ -376,7 +376,7 @@ not a reproduction of a named paper.
 
 \subsection{Model}
 
-Each $(\xi_t,y_t,t/T)$ token is embedded by a multilayer perceptron. A masked mean and
+Each $(\bm{x}_t,y_t,t/T)$ token is embedded by a multilayer perceptron. A masked mean and
 masked maximum produce a permutation-aware fixed-width history representation. An
 empty-history embedding is learned. Two heads consume the representation:
 \begin{itemize}
