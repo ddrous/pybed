@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use PyBED, please cite this software and the benchmark methods you evaluate."
+title: "PyBED: Composable and reproducible environments for Bayesian experimental design"
+type: software
+authors:
+  - name: "PyBED contributors"
+version: 0.1.0
+date-released: 2026-09-03
+license: MIT
+

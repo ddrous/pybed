@@ -1,0 +1,8 @@
+include CITATION.cff
+include CHANGELOG.md
+include CONTRIBUTING.md
+include LICENSE
+include README.md
+recursive-include docs *.tex
+recursive-include examples *.py
+recursive-include tests *.py

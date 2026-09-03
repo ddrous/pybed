@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pybed"
+version = "0.1.0"
+description = "Composable and reproducible environments for Bayesian experimental design"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "PyBED contributors"}]
+keywords = ["bayesian experimental design", "simulation-based inference", "benchmark", "pytorch"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "torch>=2.1",
+  "matplotlib>=3.7",
+  "seaborn>=0.12",
+]
+
+[project.optional-dependencies]
+jax = ["jax>=0.4"]
+mnist = ["torchvision>=0.16"]
+dev = ["build>=1.2", "pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+include = ["pybed*"]
+
+[tool.setuptools.package-data]
+pybed = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
