@@ -1,7 +1,7 @@
 \documentclass[11pt]{article}
 
 \usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,bm,booktabs,array}
+\usepackage{amsmath,amssymb,booktabs,array}
 \usepackage{microtype}
 \microtypesetup{expansion=false}
 \usepackage{xcolor}
@@ -13,7 +13,13 @@
 \definecolor{navy}{HTML}{264653}
 \definecolor{teal}{HTML}{2A9D8F}
 \definecolor{paper}{HTML}{F7F7F5}
-\hypersetup{colorlinks=true,linkcolor=navy,citecolor=teal,urlcolor=teal,pdftitle={PyBED Technical Report}}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=navy,
+  citecolor=teal,
+  urlcolor=teal,
+  pdftitle={PyBED Technical Report}
+}
 \lstset{
   language=Python,
   basicstyle=\ttfamily\small,
@@ -34,481 +40,577 @@
 \pagestyle{fancy}
 \setlength{\headheight}{14pt}
 \fancyhf{}
-\lhead{PyBED v0.1}
+\lhead{PyBED v0.2}
 \rhead{Technical report}
 \cfoot{\thepage}
 
-\title{\textbf{PyBED: A Composable and Reproducible Interface for Bayesian Experimental Design}}
+\title{\textbf{PyBED: A Small Interface for Bayesian Experimental Design and Inverse Problems}}
 \author{PyBED contributors}
-\date{Version 0.1.0 -- September 2026}
+\date{Version 0.2.0 -- September 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-Bayesian experimental design (BED) methods often share scientific problems but not
-their data abstractions, simulator interfaces, random-number conventions, metrics,
-or experiment records. This makes apparently direct comparisons difficult to audit.
-PyBED is a compact Python package that standardizes these common layers while leaving
-the method itself replaceable. Its central object composes a prior, simulator, space
-specifications, and optional design, inference, prediction, and visualization
-components. Explicit seed derivation guarantees the same ordered latent parameters
-within a synthetic epoch across competing policies. Finite generated epochs can be
-saved and reloaded for posterior-only training. Reference environments cover source
-location, MNIST image discovery, initial-field inference in an advection-diffusion
-PDE, stochastic pendulum identification, CES preferences, and a pure-death process.
-This report motivates the design, defines its contracts, documents the numerical
-models, and explains the included single-file ActionBED example and validation suite.
+Bayesian experimental design methods often use the same scientific problem but
+reimplement its simulator, histories, random draws, metrics, and saved data. Those
+differences make method comparisons hard to read and harder to trust. PyBED keeps
+this shared layer small. An environment combines a prior, a simulator, shape
+information, and optional design, inference, prediction, likelihood, candidate-set,
+and joint-model callables. A batch stores complete observations
+$o_t=(x_t,y_t)$, optional particle beliefs, targets, masks, and problem context.
+The same interface covers likelihood-based DAD, likelihood-free iDAD, joint models
+such as ALINE and JADAI, task-driven Action-BED, PSST-style particle transport,
+and amortized Bayesian inverse problems trained from joint samples. This report
+defines the implementation as shipped in PyBED 0.2, documents every benchmark and
+data path, and explains the included plain-PyTorch and Lightning/W\&B examples.
 \end{abstract}
 
 \tableofcontents
 \newpage
 
-\section{Motivation}
+\section{Problem and scope}
 
-A sequential BED problem has an unknown parameter $\theta$, a design $\bm{x}_t$, an
-outcome $y_t$, and history
+A sequential experiment has an unknown quantity $\theta$, a design $x_t$, an
+outcome $y_t$, and the complete observation
 \begin{equation}
-  h_t = \{(\bm{x}_i,y_i)\}_{i=1}^{t}.
+  o_t=(x_t,y_t).
 \end{equation}
-A policy $\pi$ maps the history to a distribution over the next design, while an
-inference method represents $p(\theta\mid h_t)$ or a target derived from it. This
-abstract structure appears in amortized likelihood-based design, likelihood-free
-design, joint acquisition and inference, and particle-transport methods. DAD
-amortizes a non-myopic policy using sequential prior contrastive estimation
-\cite{foster2021dad}; iDAD replaces an explicit likelihood with mutual-information
-estimators \cite{ivanova2021idad}; ALINE jointly represents inference and targeted
-acquisition with structured attention \cite{huang2025aline}; and JADAI trains a
-policy and high-capacity posterior estimator end to end \cite{bracher2025jadai}.
+The history after $t$ steps is $h_t=(o_1,\ldots,o_t)$. A design policy uses
+$h_t$ to choose $x_{t+1}$. An inference model uses the same history to return a
+posterior distribution, a point, logits, or particles. A prediction model may
+instead target a future outcome or another downstream quantity.
 
-Despite this shared mathematical core, published implementations commonly differ in
-simulator constants, tensor order, padding, episode generation, seed reuse, metric
-reduction, and run bookkeeping. The result is avoidable uncertainty: a comparison may
-measure a dataloader or simulator difference instead of a policy difference. PyBED
-therefore standardizes the experimental substrate, not the learning algorithm.
+An ordinary inverse problem is the no-design special case
+\begin{equation}
+  y=G(\theta,\eta),
+\end{equation}
+where $x$ is absent and $o=(\varnothing,y)$. Keeping that case in the same data
+model matters: simulation-based inference and BED differ in when a design is
+chosen, not in the basic meaning of paired parameter and observation data.
 
-The package is guided by four constraints:
-\begin{enumerate}
-  \item \textbf{Small interface.} The public verbs are \texttt{simulate},
-  \texttt{design}, \texttt{infer}, and \texttt{predict}.
-  \item \textbf{Composition over inheritance.} Components are callables that can be
-  replaced on an immutable environment value.
-  \item \textbf{Explicit randomness.} An experiment is reproducible from named seed
-  streams rather than hidden mutable generator state.
-  \item \textbf{Method neutrality.} PyBED does not require a particular posterior,
-  policy, objective, optimizer, or trainer.
-\end{enumerate}
+PyBED standardizes the parts that can reasonably be shared:
+\begin{itemize}
+  \item prior sampling and optional likelihood evaluation;
+  \item batched simulation, histories, masks, and targets;
+  \item adaptive and non-adaptive data collection;
+  \item particle beliefs, candidate sets, and policy sample information;
+  \item reproducible saved datasets, replay, scores, figures, and run records.
+\end{itemize}
+It does not prescribe a neural architecture, optimizer, information estimator,
+reinforcement-learning algorithm, neural operator, or training service.
 
-\section{Architecture}
+\section{The public data model}
 
-\subsection{The BED value object}
+\subsection{Observation names}
 
-The class \texttt{BED} is an immutable value containing the following fields.
+The main storage names are \texttt{x} and \texttt{y}. Familiar longer names remain
+available, while \texttt{o} and \texttt{obs} mean the complete pair:
+\begin{lstlisting}
+batch = pb.Batch(theta=theta, x=x, y=y)
+
+batch.x          # design
+batch.design     # the same design
+batch.y          # measured outcome
+batch.outcome    # the same outcome
+batch.o          # Observation(x, y)
+batch.obs        # the same complete observation
+\end{lstlisting}
+An \texttt{Observation} is a small named pair. It can be unpacked as
+\texttt{x, y = batch.o}; unlike concatenation, it remains valid when $x$ is a
+vector and $y$ is an image. For inverse problems, \texttt{batch.x is None} and
+the outcome remains in \texttt{batch.y}.
+
+This is a deliberate change from version 0.1, where \texttt{Batch.obs} meant only
+$y$. Saved version-1 datasets remain readable; newly saved datasets use explicit
+\texttt{x} and \texttt{y} fields.
+
+\subsection{Batch fields and shapes}
 
 \begin{center}
-\begin{tabular}{>{\ttfamily}p{0.19\linewidth}p{0.69\linewidth}}
+\begin{tabular}{>{\ttfamily}p{0.16\linewidth}p{0.72\linewidth}}
 \toprule
-Field & Contract \\
+Field & Meaning \\
 \midrule
-prior & Object with \texttt{sample(shape, generator=...)} and optional
-\texttt{log\_prob}; may also be a context-dependent callable. \\
-sim & Callable from parameter and design to an observation; receives explicit
-generator and accepted context arguments. \\
-specs & Event-shape and optional bound declarations for \texttt{theta},
-\texttt{design}, and \texttt{obs}. \\
-policy & Optional callable mapping a history to the next design. \\
-posterior & Optional callable mapping a history and target context to an inference
-object. \\
-predictor & Optional callable mapping a query and history to a prediction. \\
-visualizers & Named plot callables local to the problem or user. \\
-cfg & Readable numerical configuration and provenance. \\
-target & Optional callable defining a label, parameter subset, image, or predictive
-target from $\theta$. \\
+theta & Latent truth, optional when real observations have no known truth. \\
+x & Designs with usual shape $(B,T,\ldots)$; optional for inverse problems. \\
+y & Outcomes with usual shape $(B,T,\ldots)$, or $(B,\ldots)$ without a design sequence. \\
+mask & Boolean valid-step mask of shape $(B,T)$. \\
+target & Label, selected parameter, image, predictive value, or downstream action target. \\
+belief & Optional batched \texttt{ParticleCloud}. \\
+context & Per-example masks, dimensions, physical settings, or other model inputs. \\
+meta & Dataset-level provenance such as the seed, budget, and epoch number. \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Event shapes deliberately exclude batch and history axes. Thus
-\texttt{Spec((2,))} accepts both a single two-dimensional design and a batch of them.
-The summary returned by \texttt{repr(env)} exposes these contracts before any model is
-constructed.
+\texttt{Batch.history(steps)} slices axis 1 and keeps all later event axes. This
+works for scalar designs, sets of sensors, patches, and other structured events.
+\texttt{Batch.index}, \texttt{Batch.to}, and \texttt{Batch.numpy} also walk
+nested context and particle fields. Per-example context is therefore indexed and
+collated with the data rather than silently remaining at its original batch size.
 
-Composition uses \texttt{with\_components}:
+\section{Environment and component calls}
+
+\subsection{The BED value}
+
+A \texttt{BED} object holds a name, prior, simulator, event specifications, budget,
+and optional components. \texttt{Spec(shape)} describes trailing event axes only:
+\texttt{Spec((2,))} accepts one two-dimensional design or any leading batch and
+time axes followed by two.
+
+The four single-purpose verbs are:
 \begin{lstlisting}
-method_env = env.with_components(
-    simulate=custom_simulator,
-    design=policy.design,
-    infer=posterior.infer,
-    predict=predictor.predict,
+y = env.simulate(theta, x)
+x = env.design(history)
+inference = env.infer(history)
+prediction = env.predict(query, history)
+\end{lstlisting}
+\texttt{simulate} also accepts no $x$. \texttt{infer} intentionally returns
+\texttt{Any}: a point estimator is no less valid than a distribution-valued
+posterior, and an empirical cloud is not forced into a density interface.
+
+Components are ordinary callables:
+\begin{lstlisting}
+method = env.with_components(
+    simulate=my_simulator,
+    design=my_policy,
+    infer=my_posterior,
+    predict=my_predictor,
+    log_prob=my_likelihood,
+    candidates=my_candidates,
 )
 \end{lstlisting}
-The original environment remains unchanged. Callable signatures are inspected, and
-only compatible context arguments are forwarded. This permits a two-argument NumPy
-simulator, a PyTorch module that consumes masks, or a richer callable receiving
-\texttt{epoch}, \texttt{time}, and \texttt{target} to occupy the same slot.
+The original environment is unchanged. PyBED inspects callable signatures and only
+passes named context that the callable accepts. There is no base model class.
 
-\subsection{The batch interchange object}
+\subsection{One-pass joint models}
 
-\texttt{Batch} contains arrays for $\theta$, designs, observations, a valid-history
-mask, an arbitrary target, context, and metadata. Fixed and variable-length histories
-therefore share one representation:
+ALINE and the shared PSST policy can update inference and choose a design in one
+backbone pass. Calling separate heads through separate public verbs would repeat
+that work. PyBED therefore provides three combined calls:
+\begin{align*}
+ \texttt{infer\_design}(h)
+   &\longrightarrow (\text{inference},x),\\
+ \texttt{design\_predict}(h)
+   &\longrightarrow (x,\text{prediction}),\\
+ \texttt{design\_infer\_predict}(h)
+   &\longrightarrow (x,\text{inference},\text{prediction}).
+\end{align*}
+The word order is the output order. A model attaches only the calls it computes
+together:
+\begin{lstlisting}
+method = env.with_components(
+    infer_design=model.infer_design,
+    design_infer_predict=model.design_infer_predict,
+)
+\end{lstlisting}
+An attached 	exttt{design_infer_predict} component also serves either two-output
+verb by returning the requested members. Otherwise, the environment composes the
+available single-purpose calls. Thus separate models and genuinely shared models
+use one public surface without pretending their compute graphs are the same.
+
+When \texttt{Stream} uses an attached joint model, it calls that model once at each
+adaptive step. A returned \texttt{ParticleCloud} becomes the next history's belief.
+
+\subsection{Likelihoods and score-function policies}
+
+An optional observation likelihood has the direct order
+\begin{lstlisting}
+log_p = env.log_prob(y, theta, x)
+\end{lstlisting}
+and may omit $x$ for an inverse problem. The location and MNIST-patch environments
+provide their Gaussian likelihoods. Likelihood-free environments simply leave this
+component absent.
+
+A deterministic policy returns $x$. A sampled policy may return
+\begin{lstlisting}
+pb.PolicySample(x=x, log_prob=log_prob, entropy=entropy)
+\end{lstlisting}
+so REINFORCE-like training retains the terms produced by the actual sampling step.
+PyBED does not define the reward, baseline, discounting, or credit assignment,
+because those choices belong to the method.
+
+\subsection{Candidate sets}
+
+\texttt{candidate\_pool} may be a fixed tensor, a batched tensor, or a callable of
+the current history. \texttt{env.candidates(history)} returns it, and PyBED passes
+it to policies and joint calls under the clear argument name \texttt{candidates}.
+A random policy samples uniformly from a supplied pool and returns its log
+probability. Continuous policies are unaffected.
+
+\section{Particle methods}
+
+\texttt{ParticleCloud} keeps
+\begin{equation}
+  C=(\{\theta^{(s)}\}_{s=1}^{S},\{w_s\}_{s=1}^{S},m_\theta),
+\end{equation}
+where weights and a parameter mask are optional. The class computes a weighted
+mean, effective sample size, and weighted resampling, and supports device and NumPy
+conversion. Batched storage conventionally has shape
+$(B,S,\ldots)$ and \texttt{particle\_dim=1}; an unbatched empirical prior uses
+\texttt{particle\_dim=0}.
+
+Two roles are kept separate:
+\begin{itemize}
+  \item \texttt{EmpiricalPrior} resamples a fixed initial cloud to draw truths;
+  \item \texttt{Batch.belief} carries a changing, per-episode belief used by a
+  model during sequential inference and design.
+\end{itemize}
+This distinction is necessary for PSST. Its current cloud $C_t$ is a model state,
+not merely the probability law that generated the hidden truth once.
+
+For a categorical target, particles may be labels or one-hot vectors. If
+$z^{(s)}\in\{e_0,\ldots,e_9\}$, then
+\begin{equation}
+  \widehat p(z=k\mid h)=\sum_s \bar w_s z^{(s)}_k.
+\end{equation}
+\texttt{metrics.class\_probabilities} returns these normalized counts. PyBED does
+not sharpen or calibrate them.
+
+\section{Data generation and reuse}
+
+\subsection{Seeds}
+
+\texttt{Seeds(seed)} creates a repeatable Torch or NumPy generator from a short
+label and integer indices. Separate labels are used for truths, designs, simulator
+noise, and loader order. This makes a small code change in one part of an
+experiment less likely to change every later random draw.
+
+For a fixed environment, root seed, and epoch, one \texttt{Stream} caches the same
+ordered latent truths for each policy. \texttt{exp.compare} checks that equality
+before reporting policy scores.
+
+\subsection{Stream}
+
+\texttt{Stream(env, episodes, seed, budget)} materializes a finite dataset.
+Adaptive policies are called step by step because $x_{t+1}$ depends on $h_t$.
+For a non-adaptive experiment, \texttt{Stream} instead:
+\begin{enumerate}
+  \item creates the whole tensor $x_{1:T}$, or accepts it from the user;
+  \item adds the time axis to $\theta$ and per-example context;
+  \item calls a vectorized simulator once.
+\end{enumerate}
+This is used automatically when there is no policy. Custom simulators that cannot
+accept a leading time axis set \texttt{vectorized=False} and use the clear
+step-by-step path.
+
+\begin{lstlisting}
+stream = pb.data.Stream(env, episodes=8192, seed=42)
+random_data = stream.generate()
+fixed_data = stream.generate(x=fixed_x)
+adaptive_data = stream.generate(policy)
+\end{lstlisting}
+
+\subsection{Dataset files and replay}
+
+\texttt{EpisodeDataset} requires paired $\theta$ and $y$ but no longer requires
+$x$. This directly represents the i.i.d. joint data used by amortized inverse
+methods. Version-2 files store $\theta$, $x$, $y$, masks, targets, beliefs, nested
+context, metadata, and a readable JSON shape manifest. Version-1 files are upgraded
+while loading.
+
+\texttt{ReplayBuffer(capacity)} keeps recent detached Batch rows. Adding a large
+batch splits it into rows; sampling collates rows back into a batch. This supports
+PSST-style reuse of truth, evidence, predicted particles, shape masks, and policy
+terms without defining a PSST-specific buffer. It complements rather than replaces
+a stable saved dataset.
+
+\section{Reference environments}
+
+\subsection{Location finding, including mixed shapes}
+
+For source $k$ at $\theta_k\in\mathbb R^d$ and sensor $x\in\mathbb R^d$,
+\begin{equation}
+  \mu(\theta,x)
+  =b+\sum_{k=1}^{K}\frac{\alpha_k}
+  {m+\lVert\theta_k-x\rVert_2^2},
+  \qquad
+  y=\log\mu(\theta,x)+\sigma\epsilon.
+\end{equation}
+All constants and the log transform are configurable. The implementation is
+differentiable in $x$ and $\theta$ and provides the Gaussian log likelihood used
+by DAD.
+
+Fixed problems use integer \texttt{sources} and \texttt{dims}. A single training
+run may instead use choices:
+\begin{lstlisting}
+env = pb.make(
+    "location-v0",
+    sources=(1, 2, 4),
+    dims=(1, 2, 3),
+)
+\end{lstlisting}
+The prior samples a source count and dimension for each episode, pads to the largest
+shape, and records \texttt{num\_sources}, \texttt{source\_dim},
+\texttt{source\_mask}, and \texttt{theta\_mask}. Masked sources and coordinates
+make no contribution to the signal. A model may use the same masks for attention.
+
+\subsection{MNIST discovery and classification}
+
+\texttt{mnist-discovery-v0} returns a smooth masked full image at each continuous
+centre. It is useful for posterior image reconstruction.
+
+\texttt{mnist-classification-v0} implements the Action-BED task
+\cite{rossa2026actionbed}. The latent parameter is an image
+$\theta\in[0,1]^{1\times28\times28}$ and the target is its label
+$z\in\{0,\ldots,9\}$. A design $x\in[0,1]^2$ gives a continuous top-left
+patch location. Bilinear grid sampling returns
+\begin{equation}
+  y=A_x\theta+\eta,\qquad
+  \eta\sim\mathcal N(0,\sigma^2 I_{25}).
+\end{equation}
+Zero padding applies outside the image and the default horizon is five. Bilinear
+sampling keeps the simulator differentiable in $x$. The image and label are sampled
+together, so a batch cannot accidentally mismatch them.
+
+This is a hierarchical problem. The available likelihood is
+$p(y\mid\theta,x)$, while the class likelihood
+\begin{equation}
+  p(y\mid z,x)=\int p(y\mid\theta,x)p(\theta\mid z)\,d\theta
+\end{equation}
+is implicit under the empirical image bank. DAD can target image information with
+the explicit likelihood; Action-BED, ALINE, and classification critics can train
+directly for $z$.
+
+\subsection{Fields, dynamics, and preferences}
+
+\texttt{advdiff-v0} infers an initial field from time series at designed sensors.
+Its simulator uses semi-Lagrangian advection, a five-point explicit diffusion step,
+an optional reaction, bilinear sensor sampling, and Gaussian noise. It checks the
+explicit diffusion stability ratio. It is a compact differentiable reference
+solver, not a paper-exact finite-element mesh.
+
+\texttt{pendulum-v0} infers gravity and damping from a stochastic
+Euler--Maruyama trajectory whose initial angle and velocity are designed.
+\texttt{ces-v0} observes noisy preferences between designed baskets.
+\texttt{death-v0} observes the affected count of a pure-death process at a designed
+time. These broaden simulator shapes and differentiability conditions without
+adding method-specific code.
+
+\section{Generic amortized inverse problems}
+
+\texttt{envs.inverse} accepts a prior, a forward simulator, and the shapes of
+$\theta$ and $y$:
+\begin{lstlisting}
+env = pb.envs.inverse(
+    prior=prior,
+    simulator=forward,
+    theta_shape=(64, 64),
+    y_shape=(20,),
+)
+pairs = pb.data.Stream(env, 8192, seed=4).generate()
+\end{lstlisting}
+External paired data are equally direct:
+\begin{lstlisting}
+pairs = pb.data.EpisodeDataset(pb.Batch(theta=u, y=o))
+\end{lstlisting}
+
+Baptista, Kaveh, and Stuart assume $N$ i.i.d. samples
+\begin{equation}
+  \{(\theta^{(i)},y^{(i)})\}_{i=1}^{N}\sim\gamma,
+\end{equation}
+where $\gamma$ is the joint law induced by the prior and forward model
+\cite{baptista2026energy}. Their observation-dependent map
+$T_\phi(z;y)$ pushes a reference law toward $p(\theta\mid y)$. Its average
+energy-score objective is
 \begin{align}
- \theta &\in \mathbb{R}^{B\times d_\theta}, \\
- \bm{x} &\in \mathbb{R}^{B\times T\times d_x}, \\
- y &\in \mathbb{R}^{B\times T\times d_y}, \\
- m &\in \{0,1\}^{B\times T}.
+ \mathcal J(\phi)
+ ={}&\mathbb E\lVert T_\phi(z;y)-\theta\rVert \\
+ &-\frac12\mathbb E\lVert
+ T_\phi(z;y)-T_\phi(z';y)\rVert .
 \end{align}
-The event dimensions may themselves be structured; for example, an initial field has
-shape $1\times H\times W$. The mask is general enough for padded history encoders.
-ALINE-like target-specific attention remains a responsibility of the model, while the
-requested target subset can be carried in \texttt{target}. This separation prevents a
-particular Transformer mask from becoming an environment assumption.
+Only joint samples and reference samples are needed; no likelihood is evaluated.
 
-\subsection{Module boundaries}
+\texttt{metrics.energy\_score} implements this differentiably for tensor particles
+and weighted \texttt{ParticleCloud} objects. The option
+\texttt{unbiased=True} removes self-pairs from the repulsion term. If the prior is
+not separately available, distinct parameter rows from the joint sample can serve
+as empirical reference draws; method code is responsible for the required distinct
+index construction.
+
+Unknown functions are represented by their discretized tensor axes. A
+Cameron--Martin-informed map such as
+\begin{equation}
+  T_\phi(u;y)=u+C^{1/2}S_\phi(u;y)
+\end{equation}
+belongs in the model: $C^{1/2}$ and the neural operator depend on the scientific
+prior, basis, and grid. PyBED supplies paired data, fields, loaders, particles, and
+the score without claiming that a finite tensor interface alone proves a
+function-space measure result.
+
+The executable \texttt{examples/inverse/energy\_transport.py} demonstrates a
+likelihood-free $y=\theta^2+\eta$ problem with a residual transport.
+
+\section{How the method families fit}
+
+\subsection{DAD}
+
+DAD samples a generating $\theta_0$ and prior contrastives
+$\theta_1,\ldots,\theta_L$, rolls out one adaptive history, and accumulates the
+same observed-history likelihood under every candidate. PyBED supplies
+\texttt{env.log\_prob}; the objective is
+\begin{equation}
+ \widehat I_{\mathrm{sPCE}}
+ =\frac1B\sum_b\left[
+ \ell_b(\theta_0)-\log\left(
+ \frac1{L+1}\sum_{j=0}^{L}e^{\ell_b(\theta_j)}
+ \right)\right].
+\end{equation}
+\texttt{metrics.spce} consumes the $(B,L+1)$ likelihood table. The included
+\texttt{dad\_lightning\_wandb.py} example differentiates through the location
+simulator and maximizes this bound.
+
+\subsection{iDAD}
+
+iDAD uses the same $o_{1:T}$ batches and policy calls, but replaces explicit
+likelihoods with a critic and an InfoNCE or NWJ objective
+\cite{ivanova2021idad}. The critic and negative-sample construction remain in the
+method. Nothing in \texttt{Batch} requires likelihood access.
+
+\subsection{ALINE}
+
+ALINE can attach \texttt{infer\_design} or
+\texttt{design\_infer\_predict}. A candidate provider supplies its allowed query
+set; a categorical policy returns \texttt{PolicySample}; the inference member may
+be a GMM, a point, a predictive distribution, or class logits. \texttt{target}
+holds the requested parameter subset or predictive task, while attention details
+stay in the ALINE model \cite{huang2025aline}.
+
+\subsection{JADAI}
+
+JADAI attaches a posterior and differentiable design policy, separately or through
+a combined call \cite{bracher2025jadai}. Images and fields remain structured event
+axes. Reparameterized built-in simulators permit gradients from posterior quality
+through $y$ and $x$.
+
+\subsection{Action-BED}
+
+Action-BED optimizes a downstream Bayes action rather than requiring a posterior
+density \cite{rossa2026actionbed}. The downstream truth sits in
+\texttt{Batch.target}. The location example jointly trains a design policy and
+source estimator. The MNIST environment supplies the classification target, for
+which a downstream action is a ten-dimensional logit or probability vector.
+
+\subsection{PSST}
+
+PSST places its current particles in \texttt{Batch.belief}. Its shared update and
+proposal model attaches \texttt{infer\_design}; the output is the new cloud and
+next $x$. Padded location masks allow varying source counts and dimensions.
+\texttt{ReplayBuffer} can retain recent clouds with their truth and observations.
+\texttt{energy\_score} accepts the physical posterior particles directly. This
+supports both one-shot prior-to-posterior transport and repeated Bayes-map use
+without calling either one a conventional density.
+
+\section{Metrics}
+
+The metric module contains MSE, RMSE, log-MSE, negative log score, interval
+coverage, rank calibration error, exact small-source set MSE, Monte Carlo expected
+information gain, sPCE, cross entropy, and classification accuracy.
+
+For weighted particles $z_s$ with normalized weights $w_s$, the energy score is
+\begin{equation}
+  \operatorname{ES}
+  =\sum_s w_s\lVert z_s-\theta^*\rVert^\beta
+  -\frac12\sum_{s,r}w_sw_r\lVert z_s-z_r\rVert^\beta .
+\end{equation}
+The unbiased option renormalizes off-diagonal pair weights. Parameter masks are
+applied before distances. \texttt{posterior\_summary} collects common scalar
+diagnostics, while classification metrics accept logits or categorical particles.
+
+Metrics do not automatically turn a point into a distribution or sharpen a cloud.
+That keeps representation choices visible in reported comparisons.
+
+\section{Experiments, Lightning, and W\&B}
+
+\texttt{exp.Run} writes a plain local directory containing normalized
+configuration, system and Git metadata, JSONL metrics, checkpoints, figures,
+datasets, and a final summary. Checkpoints include model, optimizer, and Python,
+NumPy, CPU-Torch, and CUDA random states. \texttt{Run.log} returns the row it
+writes, so plain PyTorch code may also call
+\texttt{wandb\_run.log(row)} without an adapter.
+
+Lightning and W\&B are an optional extra rather than base dependencies:
+\begin{lstlisting}
+pip install -e '.[lightning]'
+
+WANDB_MODE=offline python examples/dad/dad_lightning_wandb.py
+
+PYBED_DEVICES=4 WANDB_MODE=online python examples/dad/dad_lightning_wandb.py
+\end{lstlisting}
+The example uses a \texttt{LightningModule}, automatic accelerator selection,
+DDP when more than one GPU is requested, Lightning checkpoints, and
+\texttt{WandbLogger}. It logs training sPCE and an evaluation trajectory. Setting
+\texttt{WANDB\_MODE=disabled} gives a fast service-free smoke run.
+
+This split keeps two useful paths:
+\begin{itemize}
+  \item small studies may use the readable local \texttt{exp.train} loop;
+  \item multi-GPU studies may use Lightning without a PyBED wrapper around its
+  trainer, callbacks, or logger.
+\end{itemize}
+
+\section{Backends and module layout}
+
+Built-in simulators use PyTorch. \texttt{backends.convert} explicitly converts
+arrays, batches, nested context, policy samples, and particle clouds to Torch,
+NumPy, or optional JAX. It uses DLPack where practical. PyBED does not silently
+translate numerical solvers across frameworks, because the result may not have the
+same numerical behavior.
 
 \begin{center}
-\begin{tabular}{lp{0.69\linewidth}}
+\begin{tabular}{lp{0.70\linewidth}}
 \toprule
-Module & Responsibility \\
+Module & Contents \\
 \midrule
-\texttt{core} & Environment, batch, spaces, priors, component dispatch, registry. \\
-\texttt{sim} & Batched reference models, differentiable PDE stepping, and SDE integration. \\
-\texttt{envs} & Configurable factories with paper-related defaults. \\
-\texttt{data} & Seed derivation, synthetic epochs, serialization, deterministic loaders. \\
-\texttt{metrics} & Posterior, predictive, calibration, and information scores. \\
-\texttt{vs} & White-grid publication graphics with large labels and ticks. \\
-\texttt{exp} & Run folders, JSONL diagnostics, checkpoints, training, comparisons. \\
-\texttt{backends} & Explicit conversion among PyTorch, NumPy, and optional JAX arrays. \\
+\texttt{core} & BED, Batch, Observation, ParticleCloud, PolicySample, specs, priors, registry. \\
+\texttt{sim} & Batched location, image, PDE, SDE, preference, and event simulators. \\
+\texttt{envs} & Benchmark factories and the generic inverse-problem factory. \\
+\texttt{data} & Stream, Seeds, datasets, loaders, serialization, replay. \\
+\texttt{metrics} & Posterior, information, calibration, set, and classification scores. \\
+\texttt{vs} & Prior, trajectory, field, image, training, and benchmark plots. \\
+\texttt{exp} & Local runs, checkpoints, a small training loop, policy comparison. \\
+\texttt{backends} & Explicit array and container conversion. \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-This structure is intentionally conventional. There is no internal plugin hierarchy,
-configuration framework, event bus, or tracking service.
+\section{Validation and limits}
 
-\section{Randomness and the meaning of an epoch}
+The tests cover shape checks, aliases, each joint-call order, component replacement,
+particle statistics, weighted and unbiased energy scores, candidate sampling,
+variable location masks, nested context collation, replay, vectorized one-call
+simulation, fixed designs, inverse pairs without $x$, MNIST patches and labels,
+simulator gradients, likelihoods, serialization, policy comparison, checkpoints,
+and quick end-to-end examples. The Action-BED, energy-transport, and optional
+Lightning/W\&B scripts each have a short configuration selected by
+\texttt{PYBED\_QUICK=1}.
 
-\subsection{Named random streams}
-
-A single sequential generator is fragile: adding one diagnostic draw changes all
-later training data. \texttt{SeedBank} instead hashes
-\begin{equation}
- s_{n,e,t} = H(s_0, n, e, t),
-\end{equation}
-where $s_0$ is the root seed, $n$ is a human-readable namespace, $e$ is an epoch, and
-$t$ is a step or other integer index. The BLAKE2b digest is mapped into PyTorch's
-generator seed range. Parameter sampling, design exploration, simulator noise,
-dataloader shuffling, and worker state use separate namespaces.
-
-For environment $E$, the ordered truth tensor in epoch $e$ is
-\begin{equation}
- \Theta_e = \operatorname{sample}\left(p_E, N;
- H(s_0, \text{``E:theta''}, e)\right).
-\end{equation}
-It does not depend on the policy name or the order in which policies are evaluated.
-Accordingly, for any policies $\pi_a$ and $\pi_b$ generated from one
-\texttt{EpochStream},
-\begin{equation}
- \Theta_e^{(a)} = \Theta_e^{(b)}
-\end{equation}
-exactly, not merely in distribution. Common simulator random numbers can also be
-enabled. Their transformations may differ because the policies choose different
-designs, but the underlying random draw at each episode and step is coupled.
-
-\subsection{Finite synthetic epochs and offline data}
-
-An online epoch is defined as $N$ newly materialized latent truths and their complete
-rollouts. It is a bookkeeping and diagnostic unit, not an assertion about an infinite
-population. The generated object implements the ordinary PyTorch dataset protocol.
-Saving it stores tensors plus a JSON sidecar containing the format version, shapes,
-and experiment metadata.
-
-This unifies two training modes:
+Important limits remain:
 \begin{itemize}
-  \item In \emph{online} training, each yielded loader is constructed from a newly
-  generated finite epoch.
-  \item In \emph{posterior-only} training, the loader traverses an already saved
-  dataset; a complete traversal is one conventional epoch.
+  \item a compact built-in environment is not automatically a paper-exact
+  reproduction;
+  \item distributed on-the-fly simulator workloads may need method-specific data
+  placement even though distributed model training works through Lightning;
+  \item high-source-count set matching needs an assignment solver rather than the
+  included exact small-set permutation metric;
+  \item a tensor discretization does not by itself preserve infinite-dimensional
+  absolute continuity;
+  \item fair comparisons must still report model size, optimizer, training budget,
+  contrastive count, particle count, seeds, and estimator uncertainty.
 \end{itemize}
-The generic \texttt{exp.train} loop accepts either sequence. Data can therefore be
-generated once for fast PSST-like posterior training, archived, and replayed by
-multiple inference methods without simulator cost.
-
-\subsection{Non-stationarity}
-
-The prior slot may be a callable returning a prior from context. A simulator may also
-accept a physical time, regime identifier, or exogenous state. Therefore a changing
-parameter law or forward model does not require a new core class. Explicit context is
-written into batches and can be included in run configuration. Reproducibility still
-requires the schedule itself to be deterministic from recorded context and seeds.
-
-\section{Reference environments and simulators}
-
-\subsection{Location finding}
-
-For $K$ sources at positions $\theta_k\in\mathbb{R}^d$ and sensor design
-$\bm{x}\in\mathbb{R}^d$, the noise-free intensity is
-\begin{equation}
- \mu(\theta,\bm{x}) = b + \sum_{k=1}^{K}
- \frac{\alpha_k}{m + \lVert\theta_k-\bm{x}\rVert_2^2}.
-\end{equation}
-The default observation follows the modern ALINE/JADAI form
-\begin{equation}
- y = \log \mu(\theta,\bm{x}) + \sigma\epsilon,
- \qquad \epsilon\sim\mathcal{N}(0,1),
-\end{equation}
-with $b=0.1$, $m=10^{-4}$, $\alpha_k=1$, and $\sigma=0.5$
-\cite{huang2025aline,bracher2025jadai}. All constants, dimensionalities, source
-counts, bounds, and log transformation are configurable. Because noise is
-reparameterized, gradients flow from a posterior loss through $y$ and $\bm{x}$ into a
-continuous policy.
-
-Multiple sources are exchangeable. The metric module therefore provides exact
-permutation-invariant set MSE for the small $K$ used in these benchmarks.
-
-\subsection{MNIST image discovery}
-
-The unknown is an image $\theta\in[0,1]^{C\times H\times W}$ and the design is a
-continuous mask center $\bm{x}\in[0,1]^2$. The smooth bivariate-logistic mask is a
-product of two soft rectangular windows. For pixel coordinate $u=(u_1,u_2)$,
-\begin{align}
- M_{\bm{x},s,h}(u) = &\,[S(u_1-x_1+h;s)+S(x_1+h-u_1;s)-1] \\
- &\times[S(u_2-x_2+h;s)+S(x_2+h-u_2;s)-1],
-\end{align}
-where $S(a;s)=(1+\exp(-a/s))^{-1}$. The observation is
-\begin{equation}
- y(u)=\operatorname{clip}_{[0,1]}\{\theta(u)M_{\bm{x},s,h}(u)+\eta(u)\},
- \quad \eta(u)\sim\mathcal{U}(0,\sigma).
-\end{equation}
-This follows the image-discovery setup documented by JADAI
-\cite{bracher2025jadai}. Arrays are supplied directly or loaded lazily through the
-optional torchvision extra. No network access occurs by default. If labels are
-provided, they become available as classification targets; otherwise the natural
-target is image reconstruction.
-
-\subsection{Advection-diffusion initial-field inference}
-
-Alexanderian et al. consider an unknown initial condition $m$ propagated by
-\begin{align}
- u_t-\kappa\Delta u + v\cdot\nabla u &= 0
- &&\text{in } D\times(0,T),\\
- u(\cdot,0)&=m,
-\end{align}
-then observed at fixed sensor locations and discrete times
-\cite{alexanderian2014}. Thus a sensor returns a time series, while the parameter is a
-spatial field. PyBED preserves exactly this parameter-design-observation abstraction.
-
-Its compact reference solver generalizes the equation to an optional linear reaction
-term $ru$ and uses:
-\begin{enumerate}
-  \item a differentiable semi-Lagrangian bilinear resampling step for advection;
-  \item a five-point explicit Laplacian for diffusion;
-  \item bilinear sensor sampling at user-specified normalized coordinates;
-  \item additive reparameterized Gaussian observation noise.
-\end{enumerate}
-The solver checks the explicit diffusion stability ratio
-$\kappa\Delta t/\Delta x^2\leq 0.24$. It accepts a constant velocity, a spatial
-velocity tensor, or a time-dependent callable. It is independent of the environment
-factory and can be reused in other PDE inverse problems.
-
-This is deliberately not a numerical reproduction of the paper's obstacle geometry,
-finite-element discretization, or Navier-Stokes-derived velocity field. Those require
-a specialized PDE package and mesh data. A researcher can replace \texttt{sim} with
-such a solver while retaining PyBED's episode and comparison protocol.
-
-\subsection{Stochastic and behavioral models}
-
-The Euler-Maruyama routine integrates
-\begin{equation}
- X_{n+1}=X_n+a(X_n,t_n)\Delta t+b(X_n,t_n)\sqrt{\Delta t}\,\epsilon_n.
-\end{equation}
-The pendulum environment uses state $(q,\dot q)$ and unknown gravity $g$ and damping
-$c$:
-\begin{equation}
- dq=\dot q\,dt,\qquad
- d\dot q=(-g\sin q-c\dot q)dt+\sigma dW_t.
-\end{equation}
-The design selects its initial angle and velocity, and the observation is a retained
-angle time series. The module additionally includes a CES preference experiment and
-a likelihood-free pure-death process, covering representative behavioral and
-epidemiological examples used in amortized design work
-\cite{foster2021dad,ivanova2021idad}.
-
-\section{Metrics and comparisons}
-
-PyBED keeps metrics in a separate module so environment visualization does not imply a
-particular scientific claim. Let $\hat\theta$, $\theta^*$, and posterior particles
-$\{z_s\}_{s=1}^{S}$ be given. Included diagnostics are:
-\begin{align}
- \operatorname{MSE} &= d^{-1}\lVert\hat\theta-\theta^*\rVert_2^2,\\
- \operatorname{logMSE} &= \log(\operatorname{MSE}+\epsilon),\\
- \operatorname{ES} &= \frac{1}{S}\sum_s\lVert z_s-\theta^*\rVert
- -\frac{1}{2S^2}\sum_{s,r}\lVert z_s-z_r\rVert.
-\end{align}
-Negative log score, RMSE, interval coverage, posterior-rank calibration error,
-posterior spread, and permutation-invariant source MSE are also provided.
-
-For tractable likelihoods, sequential prior contrastive estimation accepts the
-accumulated history log-likelihood under a generating draw $\theta_0$ and $L$ prior
-contrastives:
-\begin{equation}
- \widehat I_{\mathrm{sPCE}} =
- \frac{1}{B}\sum_{b=1}^{B}\left[
- \ell_b(\theta_0)-\log\left(
- \frac{1}{L+1}\sum_{j=0}^{L}\exp\ell_b(\theta_j)
- \right)\right].
-\end{equation}
-This is a lower bound on sequential expected information gain under the usual sPCE
-sampling construction \cite{foster2021dad}. The API requires log-likelihoods rather
-than guessing them from simulator samples, which keeps likelihood-free and
-likelihood-based evaluation scientifically distinct.
-
-\texttt{exp.compare} evaluates a name-to-policy mapping from one \texttt{EpochStream}.
-It asserts exact equality of the latent truth tensor, returns metric dictionaries, and
-retains every trajectory. A paper result can therefore be traced back to designs,
-observations, targets, masks, and seed metadata.
-
-\section{ActionBED example}
-
-The one-file example in \texttt{examples/actionbed/actionbed.py} exercises the public
-surface rather than adding privileged library hooks. It is an integration baseline,
-not a reproduction of a named paper.
-
-\subsection{Model}
-
-Each $(\bm{x}_t,y_t,t/T)$ token is embedded by a multilayer perceptron. A masked mean and
-masked maximum produce a permutation-aware fixed-width history representation. An
-empty-history embedding is learned. Two heads consume the representation:
-\begin{itemize}
-  \item a diagonal Gaussian posterior $q_\psi(\theta\mid h_t)$;
-  \item a Gaussian latent action distribution whose reparameterized sample is mapped
-  through a sigmoid into the design bounds.
-\end{itemize}
-At every step, gradients pass through the action, location simulator, new outcome,
-history encoder, and posterior. The joint prefix objective is
-\begin{equation}
- \mathcal L(\phi,\psi)=
- \frac{1}{T}\sum_{t=1}^{T}
- \mathbb E[-\log q_\psi(\theta^*\mid h_t)]
- -\lambda\,\mathcal H[\pi_\phi(\cdot\mid h_T)].
-\end{equation}
-Thus both inference and acquisition parameters are trained from posterior quality.
-The entropy term is a small collapse-prevention regularizer. The example uses gradient
-clipping and AdamW, but neither is part of the environment contract.
-
-\subsection{Workflow}
-
-The file follows a notebook narrative:
-\begin{enumerate}
-  \item construct, print, and visualize the environment;
-  \item generate an intuitive random trajectory;
-  \item define the model in the same file;
-  \item train over explicitly materialized truth epochs;
-  \item attach \texttt{design}, \texttt{infer}, and \texttt{predict};
-  \item compare learned and random policies on common truths and noise;
-  \item save log-scale loss curves, trajectories, datasets, checkpoints, and summary.
-\end{enumerate}
-The environment variable \texttt{PYBED\_QUICK=1} selects a two-epoch smoke
-configuration for continuous integration.
-
-\section{Experiment records}
-
-\texttt{Run.create} records normalized configuration, its SHA-256 digest, creation
-time, Python and PyTorch versions, platform, CUDA version, root seed, and Git commit
-when available. Metrics are append-only JSON Lines. A checkpoint contains model and
-optimizer state plus Python, NumPy, CPU Torch, and all CUDA RNG states. Restoring the
-checkpoint can therefore restore stochastic continuation as well as parameters.
-
-The folder layout is intentionally transparent:
-\begin{lstlisting}
-runs/<experiment>/<timestamp>-<config-hash>/
-  config.json
-  meta.json
-  metrics.jsonl
-  summary.json
-  checkpoints/*.pt
-  figures/*.png
-  data/*.pt
-  data/*.pt.json
-\end{lstlisting}
-There is no database, network service, or required tracking account.
-
-\section{Method integration}
-
-The framework admits the major method families without method-specific branches:
-\begin{itemize}
-  \item \textbf{DAD.} Attach its policy, generate histories, and compute sPCE from
-  its tractable likelihood evaluations.
-  \item \textbf{iDAD.} Use the same histories while optimizing InfoNCE or NWJ in the
-  external model; no environment likelihood is required.
-  \item \textbf{JADAI.} Attach both policy and posterior. High-dimensional image
-  targets remain arrays in the batch.
-  \item \textbf{ALINE.} Use \texttt{mask} for valid context and \texttt{target} for
-  selected parameter/predictive targets; its internal structured attention mask stays
-  within the model.
-  \item \textbf{PSST-like transport.} Construct \texttt{EmpiricalPrior} from a cloud,
-  or put a different cloud in each batch context. Save a synthetic dataset once for
-  fast non-sequential posterior training.
-\end{itemize}
-
-The JAX extra converts loader batches explicitly, with DLPack when possible. Built-in
-simulators are PyTorch because the requested reference implementation is PyTorch-first.
-PyBED does not pretend that automatic translation of a PDE solver preserves floating
-point behavior. A pure-JAX or NumPy callable can be attached when that backend is
-required.
-
-\section{Validation strategy}
-
-The test suite emphasizes contracts likely to invalidate a benchmark:
-\begin{enumerate}
-  \item event-shape and bound checks reject malformed calls;
-  \item component replacement leaves the source environment unchanged;
-  \item identical epoch requests reproduce truths, designs, observations, and loader
-  order;
-  \item competing policies receive bit-identical ordered truths;
-  \item saved episodes round trip with metadata and masks;
-  \item simulators return declared shapes and gradients for differentiable designs;
-  \item PDE stability checks fail early;
-  \item sPCE, proper scores, source matching, and posterior summaries are tested on
-  analytically simple cases;
-  \item the ActionBED quick configuration runs end to end in a subprocess.
-\end{enumerate}
-
-Package build, byte-code compilation, tests, a random-policy example, and the
-single-file ActionBED smoke run form the release gate. The technical report is also
-compiled and rendered to images for layout inspection.
-
-\section{Limitations and roadmap}
-
-Version 0.1 intentionally avoids a universal model abstraction. Some remaining work
-is scientific rather than infrastructural:
-\begin{itemize}
-  \item validate paper-exact environment presets and publish frozen reference datasets;
-  \item provide independently reviewed reproduction adapters for DAD, iDAD, ALINE,
-  JADAI, and PSST rather than simplified namesake baselines;
-  \item add distributed episode generation while retaining namespace-stable seeds;
-  \item add discrete, constrained, and set-valued design-space helpers;
-  \item implement paper-scale PDE meshes as optional integrations;
-  \item add pure-JAX reference simulators only where equivalence tests can be stated;
-  \item publish benchmark cards specifying likelihood, prior, units, constants,
-  precision, target, horizon, and metric estimator uncertainty.
-\end{itemize}
-
-Two cautions are central. First, common random numbers reduce variance but do not make
-policy-induced data identical; designs intentionally change the conditional
-observation distribution. Second, a shared environment is necessary but not sufficient
-for fair comparison. Training budget, architecture size, contrastive count, posterior
-sample count, evaluation seeds, and uncertainty estimates must also be reported.
 
 \section{Conclusion}
 
-PyBED turns the repeated infrastructure of Bayesian experimental design into a small,
-inspectable package. The environment is a composition of scientific callables; the
-batch makes histories and targets portable; the epoch stream makes synthetic training
-and cross-policy comparison reproducible; and metrics, plots, and local run records
-remain usable independently. This creates a practical boundary between a benchmark's
-scientific problem and a method's inductive bias, enabling researchers to replace the
-latter without accidentally replacing the former.
+PyBED 0.2 treats an observation as the pair $(x,y)$, treats particles as a
+first-class inference representation, and treats no-design inverse problems as a
+normal part of the same interface. Joint verbs avoid repeated backbone work for
+ALINE- and PSST-like models. Candidate pools, score-function values, changing
+parameter masks, replay, and vectorized non-adaptive simulation cover the practical
+gaps exposed by those methods. Optional Lightning and W\&B examples provide
+multi-GPU training and tracking without moving either dependency into the core.
+The result remains a small research library whose main objects can be read without
+learning a software framework first.
 
 \begin{thebibliography}{9}
 
@@ -522,26 +624,26 @@ Deep Adaptive Design: Amortizing Sequential Bayesian Experimental Design.
 D. R. Ivanova, A. Foster, S. Kleinegesse, M. U. Gutmann, and T. Rainforth.
 Implicit Deep Adaptive Design: Policy-Based Experimental Design without Likelihoods.
 \emph{Advances in Neural Information Processing Systems}, 2021.
-\url{https://proceedings.neurips.cc/paper/2021/hash/357a6fdf7642bf815a88822c447d9dc4-Abstract.html}.
 
 \bibitem{huang2025aline}
-D. Huang, X. Wen, A. Bharti, S. Kaski, and L. Acerbi.
+D. Huang et al.
 ALINE: Joint Amortization for Bayesian Inference and Active Data Acquisition.
 arXiv:2506.07259, 2025.
-\url{https://arxiv.org/abs/2506.07259}.
 
 \bibitem{bracher2025jadai}
-N. Bracher, L. Kuehmichel, D. R. Ivanova, X. Intes, P.-C. Buerkner, and S. T. Radev.
-JADAI: Jointly Amortizing Adaptive Design and Bayesian Inference.
+N. Bracher et al.
+Jointly Amortizing Adaptive Design and Bayesian Inference.
 arXiv:2512.22999, 2025.
-\url{https://arxiv.org/abs/2512.22999}.
 
-\bibitem{alexanderian2014}
-A. Alexanderian, N. Petra, G. Stadler, and O. Ghattas.
-A-optimal design of experiments for infinite-dimensional Bayesian linear inverse
-problems with regularized $\ell_0$-sparsification.
-\emph{SIAM Journal on Scientific Computing}, 36(5):A2122--A2148, 2014.
-\url{https://doi.org/10.1137/130933381}.
+\bibitem{rossa2026actionbed}
+L. Rossa, A. Phillips, and T. Rainforth.
+Task-Driven Bayesian Experimental Design with Singly Intractable Objectives.
+2026.
+
+\bibitem{baptista2026energy}
+R. Baptista, H. Kaveh, and A. M. Stuart.
+Energy-Based Transport for Amortized Bayesian Inference.
+arXiv:2605.15407, 2026.
 
 \end{thebibliography}
 

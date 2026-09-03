@@ -22,9 +22,9 @@ fig.savefig(OUT / "prior.png", dpi=180, bbox_inches="tight")
 
 
 # %% Generate one reproducible random-policy epoch
-stream = pb.data.EpochStream(env, episodes=32, budget=12, seed=2030)
+stream = pb.data.Stream(env, episodes=32, budget=12, seed=2030)
 episodes = stream.generate(None, epoch=0, save=OUT / "random-episodes.pt")
-print(episodes.batch.theta.shape, episodes.batch.design.shape, episodes.batch.obs.shape)
+print(episodes.batch.theta.shape, episodes.batch.x.shape, episodes.batch.y.shape)
 
 fig, ax = env.visualize("episode", episodes.batch, index=0)
 fig.savefig(OUT / "random-trajectory.png", dpi=180, bbox_inches="tight")
@@ -33,7 +33,7 @@ fig.savefig(OUT / "random-trajectory.png", dpi=180, bbox_inches="tight")
 # %% Verify the common-truth contract that policy comparisons rely on
 repeated = stream.generate(None, epoch=0)
 assert torch.equal(episodes.batch.theta, repeated.batch.theta)
-assert torch.equal(episodes.batch.design, repeated.batch.design)
-assert torch.equal(episodes.batch.obs, repeated.batch.obs)
+assert torch.equal(episodes.batch.x, repeated.batch.x)
+assert torch.equal(episodes.batch.y, repeated.batch.y)
 
 plt.show()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pybed"
-version = "0.1.0"
+version = "0.2.0"
 description = "Composable and reproducible environments for Bayesian experimental design"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 jax = ["jax>=0.4"]
 mnist = ["torchvision>=0.16"]
+lightning = ["lightning>=2.2", "wandb>=0.17"]
 dev = ["build>=1.2", "pytest>=8", "ruff>=0.6"]
 
 [tool.setuptools.packages.find]

@@ -18,11 +18,11 @@ import numpy as np
 import torch
 
 from .core import BED, Batch
-from .data import EpisodeDataset, EpochStream
+from .data import EpisodeDataset, Stream
 
 
 def seed(seed: int, *, deterministic: bool = True) -> None:
-    """Seed Python, NumPy, and PyTorch and optionally select deterministic kernels."""
+    """Take one seed and apply it to Python, NumPy, and Torch, returning nothing."""
     random.seed(seed)
     np.random.seed(seed % (2**32 - 1))
     torch.manual_seed(seed)
@@ -52,6 +52,7 @@ class Run:
         run_id: str | None = None,
         seed_value: int = 0,
     ) -> Run:
+        """Take a root, name, and configuration and return a new local experiment run."""
         root = Path(root)
         timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
         normalized = asdict(cfg) if is_dataclass(cfg) else dict(cfg)
@@ -85,7 +86,7 @@ class Run:
         return cls(path=path, cfg=normalized, started=time.time())
 
     def log(self, step: int, **metrics: float) -> dict[str, float]:
-        """Append one durable metric row and return it for notebooks/progress bars."""
+        """Take a step and scalar metrics, save them, and return the saved row."""
         row = {"step": int(step), "elapsed_s": time.time() - self.started}
         row.update({name: float(value) for name, value in metrics.items()})
         with (self.path / "metrics.jsonl").open("a", encoding="utf-8") as stream:
@@ -101,7 +102,7 @@ class Run:
         step: int = 0,
         extra: Mapping[str, Any] | None = None,
     ) -> Path:
-        """Save model, optimizer, step, config, and RNG state for exact continuation."""
+        """Take model state and a name, save a checkpoint, and return its path."""
         path = self.path / "checkpoints" / f"{name}.pt"
         payload = {
             "model": model.state_dict(),
@@ -128,6 +129,7 @@ class Run:
         map_location: str | torch.device = "cpu",
         restore_rng: bool = True,
     ) -> dict[str, Any]:
+        """Take a checkpoint and live objects, restore their state, and return its payload."""
         payload = torch.load(checkpoint, map_location=map_location, weights_only=False)
         model.load_state_dict(payload["model"])
         if optimizer is not None and payload["optimizer"] is not None:
@@ -141,14 +143,17 @@ class Run:
         return payload
 
     def save_figure(self, figure: Any, name: str, *, dpi: int = 180) -> Path:
+        """Take a figure and name, save the image, and return its path."""
         path = self.path / "figures" / f"{name}.png"
         figure.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
         return path
 
     def save_data(self, dataset: EpisodeDataset, name: str) -> Path:
+        """Take an episode dataset and name, save it, and return its path."""
         return dataset.save(self.path / "data" / f"{name}.pt")
 
     def finish(self, **summary: Any) -> Path:
+        """Take final summary values, save them, and return the summary path."""
         summary = {"elapsed_s": time.time() - self.started, **summary}
         path = self.path / "summary.json"
         path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
@@ -166,10 +171,10 @@ def train(
     grad_clip: float | None = None,
     start_epoch: int = 0,
 ) -> list[dict[str, float]]:
-    """Framework-neutral finite/online epoch loop suitable for posterior estimators.
+    """Take a model, loaders, optimizer, and loss and return per-epoch training records.
 
     Each yielded loader defines one epoch.  It can be a pass over a saved dataset
-    or one freshly materialized ``EpochStream`` epoch; the optimization semantics
+    or one freshly materialized ``Stream`` epoch; the optimization semantics
     remain identical.
     """
     model.to(device)
@@ -213,8 +218,8 @@ def compare(
     epoch: int = 0,
     budget: int | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, EpisodeDataset]]:
-    """Evaluate policies on common truths/noise and retain auditable trajectories."""
-    stream = EpochStream(env, episodes, seed=seed_value, budget=budget)
+    """Take named policies and a score and return comparable results and trajectories."""
+    stream = Stream(env, episodes, seed=seed_value, budget=budget)
     results: dict[str, dict[str, float]] = {}
     datasets: dict[str, EpisodeDataset] = {}
     reference_theta = stream.theta(epoch)

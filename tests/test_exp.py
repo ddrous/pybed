@@ -4,6 +4,7 @@ import pybed as pb
 
 
 def test_run_checkpoint_and_compare(tmp_path):
+    """Check local run files, checkpoint restoration, and policy comparison."""
     run = pb.exp.Run.create(tmp_path, "unit", {"width": 2}, run_id="fixed", seed_value=3)
     model = torch.nn.Linear(2, 1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -22,7 +23,7 @@ def test_run_checkpoint_and_compare(tmp_path):
     results, datasets = pb.exp.compare(
         env,
         {"a": None, "b": None},
-        lambda candidate, batch: {"mean": batch.obs.mean()},
+        lambda candidate, batch: {"mean": batch.y.mean()},
         episodes=8,
         seed_value=2,
     )

@@ -17,7 +17,7 @@ python -m build
 
 1. Put reusable numerical code in `pybed/sim.py`.
 2. Add a configurable factory in `pybed/envs.py`.
-3. Declare event shapes and design bounds with `Spec`.
+3. Declare event shapes and design bounds with `Spec`, using `x` for designs and `y` for outcomes.
 4. Register a versioned name such as `problem-v0`.
 5. Test batched shapes, explicit-seed reproducibility, declared gradients, and serialization.
 6. Add a short table row and scientific caveat to the README.
@@ -32,3 +32,4 @@ Metrics belong in `pybed/metrics.py` and should document tensor axes, reduction,
 
 Keep changes focused, include tests, and update the changelog. New third-party dependencies should be optional unless every environment needs them. Never commit generated run folders, datasets, credentials, or private tracking links.
 
+Keep docstrings short and concrete: say what a function takes and what it returns. Prefer ordinary research language over framework terminology.

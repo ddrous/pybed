@@ -60,13 +60,14 @@ env = pb.make(
     noise=0.5,
     log_signal=True,
 )
-seeds = pb.data.SeedBank(cfg.seed)
+seeds = pb.data.Seeds(cfg.seed)
 run = pb.exp.Run.create(cfg.runs, "actionbed", asdict(cfg), seed_value=cfg.seed)
 
 
 # %% TNP-like deterministic design policy from Appendix E.1
 class DesignPolicy(nn.Module):
     def __init__(self, budget: int):
+        """Take an experiment budget and create the sequential design network."""
         super().__init__()
         self.design_encoder = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, 32))
         self.outcome_encoder = nn.Sequential(nn.Linear(1, 64), nn.ReLU(), nn.Linear(64, 32))
@@ -82,12 +83,13 @@ class DesignPolicy(nn.Module):
         self.emitter = nn.Sequential(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 2))
 
     def forward(self, history: pb.Batch) -> torch.Tensor:
+        """Take an observation history and return the next two-dimensional design."""
         batch = len(history)
-        steps = 0 if history.design is None else history.design.shape[1]
+        steps = 0 if history.x is None else history.x.shape[1]
         if steps:
-            design = self.design_encoder(history.design)
-            outcome = self.outcome_encoder(history.obs)
-            tokens = self.adapter(self.pair(torch.cat((design, outcome), -1)))
+            x = self.design_encoder(history.x)
+            y = self.outcome_encoder(history.y)
+            tokens = self.adapter(self.pair(torch.cat((x, y), -1)))
             times = self.time(torch.arange(steps, device=tokens.device))[None]
             tokens = tokens + self.history_type + times
         else:
@@ -100,6 +102,7 @@ class DesignPolicy(nn.Module):
 # %% Separate terminal downstream action policy from Appendix G.1
 class ActionPolicy(nn.Module):
     def __init__(self, budget: int, sources: int):
+        """Take the budget and source count and create the final action network."""
         super().__init__()
         self.sources = sources
         self.net = nn.Sequential(
@@ -113,12 +116,14 @@ class ActionPolicy(nn.Module):
         )
 
     def forward(self, history: pb.Batch) -> torch.Tensor:
-        pairs = torch.cat((history.design, history.obs), -1).flatten(1)
+        """Take a complete history and return estimated source locations."""
+        pairs = torch.cat((history.x, history.y), -1).flatten(1)
         return self.net(pairs).reshape(len(history), self.sources, 2)
 
 
 class ActionBED(nn.Module):
     def __init__(self):
+        """Create the design and downstream action networks and return no separate value."""
         super().__init__()
         self.design_policy = DesignPolicy(cfg.budget)
         self.action_policy = ActionPolicy(cfg.budget, cfg.sources)
@@ -128,35 +133,39 @@ model = ActionBED().to(device)
 
 
 def sample_truth(stage: str, step: int) -> torch.Tensor:
+    """Take a training stage and step and return a repeatable batch of source locations."""
     generator = seeds.torch(stage, step, device=device)
     return torch.randn((cfg.batch_size, cfg.sources, 2), generator=generator, device=device)
 
 
 def rollout(theta: torch.Tensor, step: int, *, random: bool) -> pb.Batch:
-    history = pb.Batch(theta=theta, design=None, obs=None, mask=None)
-    designs, outcomes = [], []
+    """Take source locations and return their random or learned observation history."""
+    history = pb.Batch(theta=theta, x=None, y=None, mask=None)
+    xs, ys = [], []
     for time in range(cfg.budget):
         if random:
-            design = torch.randn((len(theta), 2), generator=seeds.torch("warm-design", step, time, device=device), device=device)
+            x = torch.randn((len(theta), 2), generator=seeds.torch("warm-design", step, time, device=device), device=device)
         else:
-            design = model.design_policy(history)
-        obs = env.simulate(
+            x = model.design_policy(history)
+        y = env.simulate(
             theta,
-            design,
+            x,
             generator=seeds.torch("noise", random, step, time, device=device),
         )
-        designs.append(design)
-        outcomes.append(obs)
-        history = pb.Batch(theta=theta, design=torch.stack(designs, 1), obs=torch.stack(outcomes, 1), mask=None)
+        xs.append(x)
+        ys.append(y)
+        history = pb.Batch(theta=theta, x=torch.stack(xs, 1), y=torch.stack(ys, 1), mask=None)
     return history
 
 
 def canonical(theta: torch.Tensor) -> torch.Tensor:
+    """Take exchangeable source locations and return a repeatable norm-based ordering."""
     order = theta.square().sum(-1).argsort(-1)
     return theta.gather(1, order[..., None].expand_as(theta))
 
 
 def future_loss(estimate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
+    """Take estimated and true sources and return the configured downstream loss."""
     if cfg.objective == "mse":
         direct = (estimate - truth).square().sum((-1, -2))
         swapped = (estimate - truth.flip(1)).square().sum((-1, -2))
@@ -168,6 +177,7 @@ def future_loss(estimate: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
 
 
 def update(optimizer: torch.optim.Optimizer, scheduler: torch.optim.lr_scheduler.ExponentialLR, step: int, *, random: bool) -> float:
+    """Take optimizer state and one step setting, update the model, and return its loss."""
     optimizer.zero_grad(set_to_none=True)
     theta = sample_truth("warm-theta" if random else "joint-theta", step)
     history = rollout(theta, step, random=random)
@@ -211,11 +221,12 @@ model.eval()
 
 
 def learned_policy(history: pb.Batch, **_: object) -> torch.Tensor:
+    """Take a rollout history and return the trained design on the CPU."""
     with torch.no_grad():
         return model.design_policy(history.to(device)).cpu()
 
 
-evaluation = pb.data.EpochStream(env, cfg.eval_episodes, seed=cfg.seed + 1, budget=cfg.budget).generate(learned_policy)
+evaluation = pb.data.Stream(env, cfg.eval_episodes, seed=cfg.seed + 1, budget=cfg.budget).generate(learned_policy)
 with torch.no_grad():
     batch = evaluation.batch.to(device)
     estimate = model.action_policy(batch)

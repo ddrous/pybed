@@ -4,7 +4,6 @@ title: "PyBED: Composable and reproducible environments for Bayesian experimenta
 type: software
 authors:
   - name: "PyBED contributors"
-version: 0.1.0
+version: 0.2.0
 date-released: 2026-09-03
 license: MIT
-

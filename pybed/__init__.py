@@ -5,7 +5,21 @@ The public surface is intentionally narrow.  Most projects need only ``make`` or
 """
 
 from . import backends, data, envs, exp, metrics, sim, vs
-from .core import BED, Batch, EmpiricalPrior, Normal, Spec, Uniform, available, make, register
+from .core import (
+    BED,
+    Batch,
+    EmpiricalPrior,
+    Normal,
+    Observation,
+    ParticleCloud,
+    Particles,
+    PolicySample,
+    Spec,
+    Uniform,
+    available,
+    make,
+    register,
+)
 
 __all__ = [
     "BED",
@@ -14,6 +28,10 @@ __all__ = [
     "Batch",
     "EmpiricalPrior",
     "Normal",
+    "Observation",
+    "ParticleCloud",
+    "Particles",
+    "PolicySample",
     "Spec",
     "Uniform",
     "available",
@@ -29,9 +47,9 @@ __all__ = [
     "visualisers",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-# Friendly compatibility aliases; ``BED`` and ``vs`` remain the canonical short names.
+# These longer spellings remain available for existing notebooks.
 BEDEnv = BED
 BEDEnvironment = BED
 visualisers = vs

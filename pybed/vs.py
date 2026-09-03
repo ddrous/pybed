@@ -18,7 +18,7 @@ from .core import Batch
 
 
 def style(context: str = "paper", font_scale: float = 1.55) -> None:
-    """Apply PyBED's white-grid publication style without running at import time."""
+    """Take plot scale settings and apply PyBED's publication style, returning nothing."""
     sns.set_theme(
         context=context,
         style="whitegrid",
@@ -48,9 +48,10 @@ def prior(
     seed: int = 0,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
-    """Visualize low-dimensional marginals or representative field samples."""
+    """Take an environment and draw count and return a prior figure and axes."""
     style()
-    theta = torch.as_tensor(env.sample_prior(n, seed=seed)).detach().cpu()
+    draw = env.sample_prior(n, seed=seed)
+    theta = torch.as_tensor(draw.theta if isinstance(draw, Batch) else draw).detach().cpu()
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.4, 5.2))
     else:
@@ -78,38 +79,47 @@ def location(
     posterior: torch.Tensor | np.ndarray | None = None,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
-    """Plot source truth, sequential sensor trajectory, and optional posterior cloud."""
+    """Take a location episode and optional posterior cloud and return its figure and axes."""
     style()
     batch = episode.numpy()
     theta = np.asarray(batch.theta[index] if np.asarray(batch.theta).ndim >= 3 else batch.theta)
-    design = np.asarray(
-        batch.design[index] if batch.design is not None and np.asarray(batch.design).ndim >= 3 else batch.design
+    x = np.asarray(
+        batch.x[index] if batch.x is not None and np.asarray(batch.x).ndim >= 3 else batch.x
     )
+    if "source_dim" in batch.context:
+        source_dim = np.asarray(batch.context["source_dim"])
+        dims = int(source_dim[index] if source_dim.ndim else source_dim)
+        theta, x = theta[..., :dims], x[..., :dims]
+    else:
+        dims = theta.shape[-1]
+    if "source_mask" in batch.context:
+        source_mask = np.asarray(batch.context["source_mask"])
+        active = source_mask[index] if source_mask.ndim > 1 else source_mask
+        theta = theta[np.asarray(active, dtype=bool)]
     if ax is None:
         fig, ax = plt.subplots(figsize=(6.8, 5.8))
     else:
         fig = ax.figure
-    dims = theta.shape[-1]
     if dims == 1:
-        steps = np.arange(len(design))
-        ax.scatter(design[:, 0], steps, c=steps, cmap="viridis", s=65, label="design")
+        steps = np.arange(len(x))
+        ax.scatter(x[:, 0], steps, c=steps, cmap="viridis", s=65, label="design")
         for source in theta[:, 0]:
             ax.axvline(source, color="#d1495b", lw=2.5, ls="--")
         ax.set(xlabel="location", ylabel="design step", title="Location-finding trajectory")
     elif dims == 2:
-        steps = np.arange(len(design))
+        steps = np.arange(len(x))
         if posterior is not None:
             cloud = np.asarray(torch.as_tensor(posterior).detach().cpu()).reshape(-1, 2)
             ax.scatter(cloud[:, 0], cloud[:, 1], s=15, alpha=0.18, color="#8f6bb3", label="posterior")
 
-        path = ax.scatter(design[:, 0], design[:, 1], c=steps, cmap="viridis", s=68, edgecolor="white", linewidth=0.65, zorder=3, label="design")
+        path = ax.scatter(x[:, 0], x[:, 1], c=steps, cmap="viridis", s=68, edgecolor="white", linewidth=0.65, zorder=3, label="design")
 
         ax.scatter(theta[:, 0], theta[:, 1], marker="*", s=260, color="#d1495b", edgecolor="white", lw=1, label="truth", zorder=5)
 
         fig.colorbar(path, ax=ax, label="design step")
         ax.set(
-            xlabel=r"design $\mathbf{x}_1$",
-            ylabel=r"design $\mathbf{x}_2$",
+            xlabel=r"design $x_1$",
+            ylabel=r"design $x_2$",
             title="Location-finding trajectory",
         )
         ax.set_xlim(env.cfg["low"], env.cfg["high"])
@@ -130,13 +140,13 @@ def image_discovery(
     index: int = 0,
     posterior: torch.Tensor | np.ndarray | None = None,
 ) -> tuple[Figure, np.ndarray]:
-    """Show ground truth, cumulative measurements, posterior, and design centers."""
+    """Take an image-discovery episode and return a three-panel figure and axes."""
     style()
     batch = episode.numpy()
     theta = np.asarray(batch.theta[index])[0]
-    obs = np.asarray(batch.obs[index])[:, 0]
-    design = np.asarray(batch.design[index])
-    cumulative = obs.max(0)
+    y = np.asarray(batch.y[index])[:, 0]
+    x = np.asarray(batch.x[index])
+    cumulative = y.max(0)
     estimate = cumulative if posterior is None else np.asarray(torch.as_tensor(posterior).detach().cpu()).squeeze()
     fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.9), constrained_layout=True)
     for axis, image, title in zip(
@@ -149,13 +159,42 @@ def image_discovery(
         axis.set_title(title)
         axis.set(xticks=[], yticks=[])
     axes[1].scatter(
-        design[:, 1] * (theta.shape[1] - 1),
-        design[:, 0] * (theta.shape[0] - 1),
-        c=np.arange(len(design)),
+        x[:, 1] * (theta.shape[1] - 1),
+        x[:, 0] * (theta.shape[0] - 1),
+        c=np.arange(len(x)),
         cmap="viridis",
         s=45,
         edgecolor="white",
     )
+    return fig, axes
+
+
+def image_classification(
+    episode: Batch,
+    *,
+    env: Any,
+    index: int = 0,
+) -> tuple[Figure, np.ndarray]:
+    """Take a masked-MNIST episode and return its image, chosen patches, and outcomes."""
+    style()
+    batch = episode.numpy()
+    image = np.asarray(batch.theta[index]).squeeze()
+    x = np.asarray(batch.x[index])
+    y = np.asarray(batch.y[index])
+    fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.9), constrained_layout=True)
+    axes[0].imshow(image, cmap="gray", vmin=0, vmax=1)
+    axes[0].scatter(
+        x[:, 1] * (image.shape[1] - 1),
+        x[:, 0] * (image.shape[0] - 1),
+        c=np.arange(len(x)),
+        cmap="viridis",
+        s=45,
+    )
+    axes[0].set(title=f"digit {int(np.asarray(batch.target[index]))}", xticks=[], yticks=[])
+    axes[1].imshow(y[:, 0].mean(0), cmap="gray")
+    axes[1].set(title="mean observed patch", xticks=[], yticks=[])
+    axes[2].plot(np.arange(len(x)), np.linalg.norm(y.reshape(len(y), -1), axis=1), marker="o")
+    axes[2].set(title="patch signal", xlabel="design step", ylabel="norm")
     return fig, axes
 
 
@@ -165,12 +204,12 @@ def pde(
     env: Any,
     index: int = 0,
 ) -> tuple[Figure, np.ndarray]:
-    """Plot an initial field, selected sensors, and their observation time series."""
+    """Take a PDE episode and return its field/sensor and time-series panels."""
     style()
     batch = episode.numpy()
     field = np.asarray(batch.theta[index]).squeeze()
-    designs = np.asarray(batch.design[index])
-    observations = np.asarray(batch.obs[index])
+    designs = np.asarray(batch.x[index])
+    observations = np.asarray(batch.y[index])
     fig, axes = plt.subplots(1, 2, figsize=(11.6, 4.8), constrained_layout=True)
     image = axes[0].imshow(field, origin="lower", extent=(0, 1, 0, 1), cmap="mako")
     points = designs.reshape(-1, 2)
@@ -192,10 +231,10 @@ def timeseries(
     index: int = 0,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
-    """Generic trajectory view for scalar designs or vector time-series outcomes."""
+    """Take a trajectory episode and return a time-series figure and axes."""
     style()
     batch = episode.numpy()
-    obs = np.asarray(batch.obs[index])
+    obs = np.asarray(batch.y[index])
     if ax is None:
         fig, ax = plt.subplots(figsize=(7.2, 4.8))
     else:
@@ -220,7 +259,7 @@ def training(
     logy: bool = True,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
-    """Plot JSONL or in-memory training diagnostics; loss uses log scale by default."""
+    """Take training records and return a diagnostic figure and axes."""
     style()
     if isinstance(records, (str, Path)):
         records = [json.loads(line) for line in Path(records).read_text().splitlines() if line.strip()]
@@ -250,7 +289,7 @@ def benchmark(
     metric: str,
     ax: Axes | None = None,
 ) -> tuple[Figure, Axes]:
-    """Compact policy comparison plot from ``exp.compare`` results."""
+    """Take policy results and a metric name and return a comparison figure and axes."""
     style()
     names = list(results)
     values = [results[name][metric] for name in names]
