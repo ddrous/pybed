@@ -335,3 +335,43 @@ PyBED includes MSE, RMSE, log-MSE, negative log score, weighted energy score, in
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+
+
+
+
+
+
+
+
+## CURRENT API
+
+```python
+import pybed as pb
+
+# create a benchmarking environment
+env = pb.make("location-v0", sources=2, dims=2, budget=30)
+
+# attach components
+env = env.with components(
+	design policy={"random": None, "aline": None, "p-sapt": None},
+	inference engine==my posteriors,
+	predictor=my predictors,
+	simulator=my custom diff sim,
+)
+
+world = {env, agents, }
+
+
+check_dimensionalities (env okay with agents?)
+
+
+# compare one or more policies
+# four core interfaces
+for theta in env.Stream(T=30, seed=0)
+	y = env.simulate(theta, xi, seed=1)
+	xi new = env.design(history, infer=False, predict=False).xi
+	theta hat = env.infer(history).theta
+	y hat = env.predict(query, history).y
+```
